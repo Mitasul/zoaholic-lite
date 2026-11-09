@@ -1,0 +1,860 @@
+"""
+透传请求处理模块。
+
+修改原因：core.handler.py 文件过大，透传请求处理逻辑需要独立维护。
+修改方式：将原 handler.py 中的透传 helper 和 process_request_passthrough 原样迁移到本文件，并由 core.handler 重新导出。
+目的：保持外部导入路径兼容，同时让普通请求与透传请求的职责边界更清楚。
+"""
+
+import asyncio
+import json
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+
+import httpx
+from fastapi import BackgroundTasks, HTTPException
+from starlette.responses import Response
+
+from core.byok import get_byok_real_key, is_byok_provider
+from core.json_utils import json_dumps_bytes
+from core.log_config import logger
+from core.models import RequestModel
+from core.request import get_payload
+from core.response import check_response
+from core.streaming import LoggingStreamingResponse
+from core.stream_utils import close_async_iterator, OwnedAsyncIterator
+from core.stream_errors import reset_stream_state, extract_stream_error, UpstreamStreamError
+from core.utils import get_engine, get_model_dict, is_local_api_key, provider_api_circular_list
+from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout, iter_sse_with_keepalive
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
+# 修改原因：process_request_passthrough 的默认值原来绑定 handler.DEFAULT_TIMEOUT，函数拆出后不能在模块顶层反向导入 handler。
+# 修改方式：在本模块保留同值常量，仅用于函数默认参数绑定。
+# 目的：保持默认超时时间不变，并避免与 core.handler 的兼容导入形成循环依赖。
+DEFAULT_TIMEOUT = 600
+
+
+# ── 透传入站头隐私清洗（内置原 header_scrubber 插件）──
+
+# ⑤ 隐私/泄露头：客户端链路注入的 IP、地理位置、追踪、隐私与浏览器指纹
+_PASSTHROUGH_STRIP_EXACT = frozenset({
+    # 客户端真实 IP（CDN / LB / 应用框架变体）
+    "via", "forwarded", "x-forwarded", "cdn-loop",
+    "true-client-ip", "fastly-client-ip", "client-ip",
+    "x-client-ip", "x-cluster-client-ip", "x-originating-ip",
+    "proxy-client-ip", "wl-proxy-client-ip",
+    "x-proxyuser-ip", "x-remote-addr", "remote-addr",
+    "x-coming-from", "x-from-ip", "x-host", "x-scheme",
+    # 地理位置（CF 会把国家/城市塞进 cf-* 前缀头，accept-language 是最强地区信号）
+    "x-country-code", "x-timezone", "accept-language",
+    # 个人隐私 / 反代域名泄露
+    "cookie", "origin", "referer", "from",
+    # 浏览器指纹（暴露 Web UI 而非 SDK）
+    "dnt", "upgrade-insecure-requests", "priority", "pragma",
+    "purpose", "sec-purpose", "sec-gpc",
+    "device-memory", "viewport-width", "rtt", "downlink", "ect",
+    # 分布式追踪（可能含内网服务名）
+    "traceparent", "tracestate", "baggage", "b3",
+    "x-request-id", "x-correlation-id", "x-trace-id", "x-span-id",
+    "x-cloud-trace-context",
+    # hop-by-hop 残留（RFC 9110 §7.6.1 规定不得转发）
+    # 故意不删 connection / keep-alive：值只有 keep-alive|close，零隐私价值，
+    # 而部分逆向渠道的出站白名单保留了 connection。需要时用 strip_passthrough_headers 手动删。
+    "proxy-connection", "proxy-authorization",
+    "te", "trailer", "upgrade", "expect",
+})
+
+_PASSTHROUGH_STRIP_PREFIXES = (
+    "x-forwarded-",   # -for / -host / -proto / -port / 未来变体
+    "x-original-", "x-real-",
+    # cf-*：connecting-ip / ray / visitor 以及 ipcountry / ipcity / region / timezone /
+    # iplatitude / iplongitude 等整套地理头；未来新增的 cf 地理头自动覆盖。cf-aig-* 由 PROTECTED 救回。
+    "cf-",
+    "cloudfront-",    # AWS CloudFront viewer-country / -city / -latitude
+    "x-azure-",       # Azure Front Door clientip（与受保护的 azure- 不同）
+    "x-akamai-",      # Akamai edgescape country / region / lat
+    "fly-", "x-geo-",
+    "sec-ch-", "sec-fetch-",
+    "x-envoy-", "x-b3-", "x-datadog-", "x-newrelic",
+    "x-amzn-trace",   # ALB 追踪（与受保护的 x-amz- 不冲突：第 5 字符 'n' ≠ '-'）
+    "x-appengine-", "x-vercel-", "x-nf-", "x-render-", "x-railway-",
+)
+
+# ④ SDK / 云签名功能头：命中即保留
+_PASSTHROUGH_PROTECTED_EXACT = frozenset({
+    "accept",
+    # Codex / 各家 CLI 的身份头
+    "session_id", "originator", "x-session-id", "x-client-name", "x-client-version",
+    "x-request-timeout", "x-portkey-provider",
+})
+
+_PASSTHROUGH_PROTECTED_PREFIXES = (
+    "x-amz-",         # AWS SigV4 签名集合 —— 删任何一个都会 403
+    "x-goog-",        # Vertex / Google
+    "x-ms-", "azure-",
+    "anthropic-",     # anthropic-version / -beta / -dangerous-direct-browser-access
+    "openai-",        # openai-beta / -organization / -project
+    "x-stainless-",   # 官方 SDK 自洽伴生头；删了会让 UA 与伴生头不匹配，反而更可疑
+    "cf-aig-",        # CF AI Gateway 功能头（会被 cf- 前缀命中，靠本行救回）
+    "grpc-",
+)
+
+# 该渠道在本清洗之后会把出站头裁剪到自己的极小出站白名单，且对请求头极其敏感，直接跳过隐私清洗
+_PASSTHROUGH_SCRUB_SKIP_ENGINES = frozenset({"antigravity"})
+
+
+def _passthrough_scrub_preferences(provider: Optional[Dict[str, Any]]) -> tuple:
+    """读取渠道级 keep/strip 逃生舱配置（preferences.keep/strip_passthrough_headers）。
+
+    支持列表或分号/逗号分隔的字符串；返回两个小写头名集合。
+    keep 用于救回隐私集合里的头（如 Cookie 认证渠道），strip 用于额外删除（可突破 PROTECTED）。
+    域前置场景不需要 keep=host：preferences.headers 在本过滤之后合并，显式设置即生效。
+    """
+    prefs = provider.get("preferences") if isinstance(provider, dict) else None
+    prefs = prefs if isinstance(prefs, dict) else {}
+
+    def _names(key: str) -> set:
+        raw = prefs.get(key) or []
+        if isinstance(raw, str):
+            raw = [p.strip() for p in raw.replace(";", ",").split(",")]
+        return {str(n).strip().lower() for n in raw if str(n).strip()}
+
+    return _names("keep_passthrough_headers"), _names("strip_passthrough_headers")
+
+
+def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
+                                provider: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """过滤入口请求头，避免透传错误信息到上游。
+
+    修改原因：旧实现只删 7 个认证/传输头，nginx/CF 注入的客户端真实 IP（x-forwarded-for、
+    x-real-ip、cf-connecting-ip）、地理位置（cf-ipcountry、accept-language）、反代域名
+    （origin/referer）与面板 session（cookie）会全量透传给上游，属于默认即存在的隐私泄露。
+    修改方式：把 header_scrubber 插件的清洗规则内置到透传头过滤器，在 preferences.headers
+    合并之前执行（管理员显式配置的头天然不受影响，无需插件那套保护逻辑）。
+    匹配顺序（命中即停）：
+      ① DROP_ALWAYS   认证替换/传输完整性头，无条件删除，keep 也救不回
+      ② strip_passthrough_headers  管理员显式额外删除（可突破 PROTECTED）
+      ③ keep_passthrough_headers   管理员显式保留（从隐私清洗集合救回）
+      ④ PROTECTED     SDK/云签名功能头，命中即保留
+      ⑤ STRIP         IP/地理/追踪/隐私/浏览器指纹，删除
+      ⑥ 默认放行       未知头一律保留（保守，新客户端功能头不受影响）
+    目的：透传出站请求默认不再携带客户端链路泄露头；openrouter 的 http-referer/x-title
+    等客户端主动设置的头默认保留（比插件版保守一档）；user-agent 不碰（渠道身份的一部分）。
+    """
+    # ① 认证替换 / 传输完整性：删了必须删，不可通过 keep 恢复
+    #    host：残留的入站 Host（= 面板域名）既泄露反代域名又造成上游路由错配，
+    #          需要域前置时用 preferences.headers 显式设置（在本过滤之后合并）。
+    #    content-length / accept-encoding / transfer-encoding：由 httpx 重算。
+    drop_always = {
+        "authorization", "x-api-key", "api-key", "x-goog-api-key",
+        "host", "content-length", "accept-encoding", "transfer-encoding",
+    }
+
+    # 该渠道在本清洗之后会把出站头裁剪到自己的极小白名单，此处清洗对它是纯开销，跳过隐私集合
+    engine = str((provider or {}).get("engine") or "") if isinstance(provider, dict) else ""
+    if engine in _PASSTHROUGH_SCRUB_SKIP_ENGINES:
+        return {
+            k: v
+            for k, v in (original_headers or {}).items()
+            if str(k).lower() not in drop_always
+        }
+
+    keep_extra, strip_extra = _passthrough_scrub_preferences(provider)
+
+    result: Dict[str, Any] = {}
+    for k, v in (original_headers or {}).items():
+        name = str(k).lower()
+        if name in drop_always:
+            continue
+        if name in strip_extra:
+            continue
+        if engine == "vertex-claude":
+            if name == "anthropic-version":
+                continue
+            if name == "anthropic-beta":
+                from core.channels.vertex_channel import filter_vertex_claude_beta_header
+                filtered_beta = filter_vertex_claude_beta_header(str(v))
+                if filtered_beta:
+                    result[k] = filtered_beta
+                continue
+        if name in keep_extra:
+            result[k] = v
+            continue
+        if name in _PASSTHROUGH_PROTECTED_EXACT or name.startswith(_PASSTHROUGH_PROTECTED_PREFIXES):
+            result[k] = v
+            continue
+        if name in _PASSTHROUGH_STRIP_EXACT or name.startswith(_PASSTHROUGH_STRIP_PREFIXES):
+            continue
+        result[k] = v
+    return result
+
+
+async def _fetch_passthrough_stream(
+    client,
+    url,
+    headers,
+    payload,
+    timeout,
+    engine=None,
+    model=None,
+    enabled_plugins=None,
+    provider=None,
+    api_key_info=None,
+    key_enabled_plugins=None,
+):
+    """
+    透传模式的流式响应处理
+    
+    直接转发上游 SSE 流，不做任何格式转换
+    
+    读取超时遵循渠道配置；心跳只维持下游连接，不延长上游读取期限。
+    """
+    from .response import _log_upstream_request, _apply_response_path_interceptors
+    _log_upstream_request(url, payload)
+    
+    stream_timeout = httpx.Timeout(
+        connect=15.0,
+        read=timeout,  # 使用渠道配置的空闲读取超时，避免请求无限保留
+        write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
+        pool=10.0,
+    )
+    
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        error_message = await check_response(response, "passthrough_stream")
+        if error_message:
+            # 修改原因：透传流式错误响应也要按 response → channel_outbound → key_outbound 的顺序处理。
+            # 修改方式：复用 response.py 的统一返回路径 helper，并传入渠道与 Key 级插件上下文。
+            # 目的：避免透传错误分支遗漏新增出站阶段。
+            error_message = await _apply_response_path_interceptors(
+                error_message, engine or "passthrough", model or "", is_stream=True,
+                enabled_plugins=enabled_plugins,
+                provider=provider,
+                api_key_info=api_key_info,
+                key_enabled_plugins=key_enabled_plugins,
+            )
+            yield error_message            
+            return
+        
+        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界），
+        # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
+        async for text in response.aiter_text():
+            if text:
+                text = await _apply_response_path_interceptors(
+                    text, engine or "passthrough", model or "", is_stream=True,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
+                yield text
+
+
+async def _fetch_passthrough_response(
+    client,
+    url,
+    headers,
+    payload,
+    timeout,
+    engine=None,
+    model=None,
+    enabled_plugins=None,
+    provider=None,
+    api_key_info=None,
+    key_enabled_plugins=None,
+):
+    """
+    透传模式的非流式响应处理
+    
+    直接转发上游 JSON 响应，不做任何格式转换
+    """
+    from .response import _log_upstream_request, _apply_response_path_interceptors
+    _log_upstream_request(url, payload)
+    
+    import time as _time
+    t0 = _time.time()
+    
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    t1 = _time.time()
+    logger.debug(f"[passthrough] json.dumps took {t1-t0:.3f}s")
+    
+    # 使用与流式请求相同的超时配置
+    # 避免整数超时覆盖客户端的精细超时设置
+    request_timeout = httpx.Timeout(
+        connect=15.0,
+        read=timeout,  # 使用传入的超时作为读取超时
+        write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
+        pool=10.0,
+    )
+
+    # 快路径：未启用响应插件时，直接按文本流转发。
+    # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
+    if not enabled_plugins and not key_enabled_plugins:
+        async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
+            t2 = _time.time()
+            logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
+
+            error_message = await check_response(response, "passthrough_non_stream")
+            if error_message:
+                yield error_message
+                return
+
+            async for text_chunk in response.aiter_text():
+                if text_chunk:
+                    yield text_chunk
+        return
+
+    response = await client.post(url, headers=headers, content=json_payload, timeout=request_timeout)
+    t2 = _time.time()
+    logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
+
+    error_message = await check_response(response, "passthrough_non_stream")
+    if error_message:
+        error_message = await _apply_response_path_interceptors(
+            error_message, engine or "passthrough", model or "", is_stream=False,
+            enabled_plugins=enabled_plugins,
+            provider=provider,
+            api_key_info=api_key_info,
+            key_enabled_plugins=key_enabled_plugins,
+        )
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    t3 = _time.time()
+    logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
+
+    result = response_bytes.decode("utf-8")
+    result = await _apply_response_path_interceptors(
+        result, engine or "passthrough", model or "", is_stream=False,
+        enabled_plugins=enabled_plugins,
+        provider=provider,
+        api_key_info=api_key_info,
+        key_enabled_plugins=key_enabled_plugins,
+    )
+    yield result
+
+
+async def _passthrough_error_wrapper(generator, channel_id="passthrough", keepalive_interval: Optional[int] = None, *, stream=True, current_info=None, engine=None, stream_header_timeout: Optional[float] = None):
+    """
+    透传模式的简单错误包装器。
+
+    流式与转换路径共用首段校验；正文及 SSE 帧保持原样。
+    """
+    if stream:
+        from core.stream_pipeline import prepare_stream
+        return await prepare_stream(generator, current_info=current_info, keepalive_interval=keepalive_interval,
+                                    stream_header_timeout=stream_header_timeout, engine=engine)
+    from time import time as time_now
+    start_time = time_now()
+    first_response_time = None
+    
+    async def wrapped():
+        nonlocal first_response_time
+        first_chunk = True
+        try:
+            async for chunk in generator:
+                if first_chunk:
+                    first_response_time = time_now() - start_time
+                    first_chunk = False
+
+                    error = extract_stream_error(chunk)
+                    if error:
+                        raise UpstreamStreamError(error)
+                    # 检查是否是错误响应（只检查 dict 类型的错误）
+                    if isinstance(chunk, dict) and 'error' in chunk:
+                        status_code = chunk.get('status_code', 500)
+                        detail = chunk.get('details')
+                        error_obj = chunk.get('error')
+
+                        if isinstance(detail, dict) and 'error' in detail:
+                            inner = detail.get('error')
+                            if isinstance(inner, dict):
+                                detail = inner.get('message') or detail
+                            elif isinstance(inner, str):
+                                detail = inner
+
+                        if not detail and isinstance(error_obj, dict):
+                            detail = error_obj.get('message')
+                            if not status_code or status_code == 500:
+                                status_code = error_obj.get('code') or status_code
+
+                        if not detail:
+                            detail = str(chunk)
+
+                        try:
+                            status_code = int(status_code)
+                            if status_code < 100 or status_code > 599:
+                                status_code = 500
+                        except (TypeError, ValueError):
+                            status_code = 500
+
+                        raise HTTPException(
+                            status_code=status_code,
+                            detail=str(detail)
+                        )
+
+                yield chunk
+        finally:
+            await close_async_iterator(generator)
+
+    # 透传模式：直接获取第一个 chunk，不做额外过滤。
+    # SSE 流的内容（如 event:, data:）都是有效内容，不应该被跳过。
+    gen = wrapped()
+
+    async def final_gen(first=None, wait_task=None, emit_initial_keepalive: bool = False):
+        iterator = gen
+        try:
+            if first is not None:
+                yield first
+                first = None
+            if keepalive_interval:
+                iterator = iter_sse_with_keepalive(
+                    gen, interval=keepalive_interval, wait_task=wait_task,
+                    emit_initial=emit_initial_keepalive,
+                )
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            try:
+                await close_async_iterator(iterator, wait_task)
+            finally:
+                if iterator is not gen:
+                    await close_async_iterator(gen)
+
+
+    try:
+        if keepalive_interval:
+            first, status = await wait_for_timeout(gen, timeout=keepalive_interval)
+            if status == "timeout":
+                return OwnedAsyncIterator(final_gen(wait_task=first, emit_initial_keepalive=True), gen, first), 3.1415
+            if status == "reentrant":
+                return OwnedAsyncIterator(final_gen(emit_initial_keepalive=True), gen), 3.1415
+        else:
+            first = await gen.__anext__()
+    except StopAsyncIteration:
+        await close_async_iterator(gen)
+        raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
+    except BaseException:
+        await close_async_iterator(gen)
+        raise
+    
+    return OwnedAsyncIterator(final_gen(first=first), gen), first_response_time or (time_now() - start_time)
+
+
+async def process_request_passthrough(
+    request: RequestModel,
+    provider: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    app: "FastAPI",
+    request_info_getter: Callable[[], Dict[str, Any]],
+    update_channel_stats_func: Callable,
+    passthrough_ctx: Any,
+    endpoint: Optional[str] = None,
+    role: Optional[str] = None,
+    timeout_value: int = DEFAULT_TIMEOUT,
+    keepalive_interval: Optional[int] = None,
+    force_api_key: Optional[str] = None,
+    api_key_info: Optional[Dict[str, Any]] = None,
+    key_enabled_plugins: Optional[List[str]] = None,
+    stream_header_timeout: Optional[float] = None,
+) -> Response:
+    """
+    透传模式请求处理：
+    - 复用 channel.request_adapter 生成 url/headers
+    - payload 取入口原生请求 + 轻量修改
+    - 不跑上游响应的 Canonical 转换
+    """
+    # 修改原因：core.handler 顶层需要重新导出透传函数，顶层反向导入 handler 状态会形成循环导入。
+    # 修改方式：在透传请求执行时延迟导入 handler 中保留的 helper 和 debug 标志。
+    # 目的：共享 set_debug_mode、OAuth 解析和统计写入逻辑，同时避免模块初始化时互相等待。
+    from core.handler import _fire_and_forget_channel_stats, _resolve_oauth_api_key, is_debug
+
+    from core.dialects.passthrough import apply_passthrough_modifications
+    from core.plugins.interceptors import apply_request_interceptors
+    from core.channels import get_channel
+
+    timeout_value = int(timeout_value)
+    model_dict = get_model_dict(provider)
+    original_model = model_dict[request.model]
+
+    channel_id = f"{provider['provider']}"
+    current_info_early = request_info_getter()
+    reset_stream_state(current_info_early)
+    current_info_early["_provider_cfg"] = provider
+    current_info_early["provider_id"] = channel_id
+    byok_context_key = (
+        current_info_early.get("_byok_real_key")
+        or current_info_early.get("byok_real_key")
+        or get_byok_real_key()
+    )
+    # 修改原因：透传路径也会被渠道测试传入 force_api_key，不能把所有空 api provider 都视作 BYOK。
+    # 修改方式：只有 force_api_key 与当前 BYOK 上下文真实 key 一致时才启用 BYOK 统计脱敏分支。
+    # 目的：BYOK 不泄露真实 key，同时保留普通测试和直接调用的 key 定位能力。
+    byok_provider_request = bool(force_api_key) and force_api_key == byok_context_key and is_byok_provider(provider)
+    if byok_provider_request:
+        api_key = force_api_key
+    elif force_api_key:
+        api_key = force_api_key
+    elif is_local_api_key(provider["provider"]):
+        api_key = provider["provider"]
+    elif provider.get("api"):
+        # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 不应再创建空 key 池。
+        # 修改方式：使用 get 读取现有循环列表，缺失时返回明确的配置错误。
+        # 目的：避免透传请求路径因 provider 名不存在而产生长期驻留的空 ThreadSafeCircularList。
+        circular_list = provider_api_circular_list.get(provider["provider"])
+        if not circular_list:
+            raise HTTPException(status_code=404, detail=f"Provider '{provider['provider']}' API key pool not found")
+        api_key = await circular_list.next(original_model)
+    else:
+        api_key = None
+
+    # 修改原因：BYOK 透传统计需要挂到 provider api 的显式占位符，而不能继续写入空值。
+    # 修改方式：真实上游请求仍使用 force_api_key 中的用户 key，统计和 _used_api_key 只写入 "*"。
+    # 目的：让透传请求的 channel_stats.provider_api_key 与普通请求一样按 "*" 统一聚合，同时不泄露真实 key。
+    original_api_key = "*" if byok_provider_request else api_key
+
+    # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
+    current_info_early["_used_api_key"] = original_api_key
+    current_info_early["_is_byok_request"] = byok_provider_request
+    # 修改原因：透传路径同样可能命中 OAuth 渠道，且 Codex 被动 quota 采集发生在响应读取阶段。
+    # 修改方式：在透传请求早期保存 _oauth_channel_id，并按当前 provider name 解析 OAuth key_id。
+    # 目的：避免透传请求从其他渠道读取同名账号凭据。
+    current_info_early["_oauth_channel_id"] = channel_id
+    api_key = await _resolve_oauth_api_key(app, api_key, channel_id=channel_id)
+
+    engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
+    if stream_override is not None:
+        request.stream = stream_override
+
+    channel = get_channel(engine)
+    adapter = (channel.passthrough_adapter if channel else None) or (channel.request_adapter if channel else None)
+    if not adapter:
+        raise ValueError(f"Unknown engine: {engine}")
+
+    # 提前计算代理，以便 adapter 内部创建的裸 httpx.AsyncClient 也能走代理
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+
+    from core.http import proxy_context
+    with proxy_context(proxy):
+        url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
+
+    # ── 透传 URL 路径修正 ──
+    # passthrough_adapter 返回的 URL 对应方言的"主端点"（如 Claude 的 /messages）。
+    # 当入口请求是子路径（如 /v1/messages/count_tokens）时，需要追加路径后缀。
+    #
+    # 后缀从端点的 passthrough_root 显式配置计算，不依赖 adapter URL 的路径结构，
+    # 因此无论 base_url 配成什么样（如 https://proxy.com/anthropic/v1）都能正确工作。
+    if endpoint and passthrough_ctx.dialect_id:
+        from core.dialects.registry import get_dialect as _get_dialect
+        _dialect = _get_dialect(passthrough_ctx.dialect_id)
+        if _dialect:
+            # 查找匹配当前 endpoint 的透传根路径（显式配置，不依赖路由模板字符串）
+            _root = None
+            for _ep in _dialect.endpoints:
+                if _ep.passthrough_root and endpoint.startswith(_ep.passthrough_root):
+                    if _root is None or len(_ep.passthrough_root) > len(_root):
+                        _root = _ep.passthrough_root
+            # 用 passthrough_root 计算后缀：
+            # 例如 root="/v1/messages", endpoint="/v1/messages/count_tokens" → suffix="/count_tokens"
+            if _root and len(endpoint) > len(_root):
+                _suffix = endpoint[len(_root):]  # 如 "/count_tokens"
+                url = url.rstrip("/") + _suffix
+
+    headers: Dict[str, Any] = dict(adapter_headers or {})
+    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers, provider))
+    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
+    if not has_header_case_insensitive(headers, "Content-Type"):
+        headers["Content-Type"] = "application/json"
+
+    payload = apply_passthrough_modifications(
+        passthrough_ctx.original_payload,
+        passthrough_ctx.modifications,
+        passthrough_ctx.dialect_id,
+        request_model=request.model,
+        original_model=original_model,
+    )
+
+    # 渠道级透传 payload 修饰（把"渠道特殊逻辑"收敛在各自 channel 文件内）
+    if engine == "vertex-claude" and isinstance(payload, dict) and passthrough_ctx.original_headers:
+        for _hk, _hv in passthrough_ctx.original_headers.items():
+            if str(_hk).lower() == "anthropic-version" and _hv:
+                payload["_inbound_anthropic_version"] = str(_hv).strip()
+                break
+    if channel and getattr(channel, "passthrough_payload_adapter", None):
+        payload = await channel.passthrough_payload_adapter(
+            payload,
+            passthrough_ctx.modifications,
+            request,
+            engine,
+            provider,
+            api_key,
+        )
+
+    enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+    # 修改原因：透传路径也需要 Key 级出站拦截器上下文，不能只携带渠道级 enabled_plugins。
+    # 修改方式：接收 handler 传入的 api_key_info 和 key_enabled_plugins，缺失时使用空字典兼容旧调用。
+    # 目的：让透传流式和非流式响应都能执行 key_outbound 阶段。
+    api_key_info = api_key_info or {}
+    url, headers, payload = await apply_request_interceptors(
+        request, engine, provider, api_key, url, headers, payload, enabled_plugins
+    )
+
+    # 非生成子端点（如 count_tokens）：剥掉生成专属字段，防止 overrides 塞回的字段触发上游 400
+    if url.rstrip('/').endswith('/count_tokens') and isinstance(payload, dict):
+        for _f in ('max_tokens', 'stream', 'stop_sequences', 'temperature',
+                    'top_p', 'top_k', 'metadata', 'context_management'):
+            payload.pop(_f, None)
+
+    if is_debug:
+        pass
+
+    current_info = request_info_getter()
+    current_info["dialect_id"] = passthrough_ctx.dialect_id
+
+    if current_info.get("raw_data_expires_at"):
+        safe_upstream_headers = {
+            k: v for k, v in headers.items()
+            if k.lower() not in ("authorization", "x-api-key", "api-key", "x-goog-api-key")
+        }
+        current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
+        # upstream_request_body 已移到 response.py fetch 层记录
+
+    if getattr(request, "model", None):
+        current_info["model"] = request.model
+
+    current_info["provider_id"] = channel_id
+    current_info["_provider_cfg"] = provider  # stream_guard key_rules 用
+    if byok_provider_request:
+        # 修改原因：BYOK 透传请求没有本地 provider key pool 索引，不能把真实上游 key 映射到 provider_key_index。
+        # 修改方式：显式写 None，覆盖测试或特殊入口中缺失初始化的 request_info。
+        # 目的：让日志和统计消费者都能明确知道本次没有本地渠道 key 索引。
+        current_info["provider_key_index"] = None
+    # 修改原因：BYOK 透传的 original_api_key 是统计占位符 "*"，不能参与本地 key 索引计算。
+    # 修改方式：仅非 BYOK 请求进入 provider_api_circular_list 索引匹配。
+    # 目的：保持 provider_key_index 为 None，防止 "*" 被当作本地上游 key 处理。
+    if original_api_key and not byok_provider_request:
+        try:
+            # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
+            # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。
+            # 目的：避免 token 明文进入统计索引逻辑，并保持自动冷却定位正确。
+            circular_list = provider_api_circular_list.get(provider['provider'])
+            if circular_list:
+                api_keys_list = circular_list.items
+                if original_api_key in api_keys_list:
+                    current_info["provider_key_index"] = api_keys_list.index(original_api_key)
+        except (ValueError, TypeError, AttributeError):
+            pass
+
+    proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
+    proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+
+    # 透传路径的 stream_mode 处理（与非透传路径对齐）
+    client_wants_stream = bool(request.stream)
+    if stream_mode == "force_stream":
+        upstream_stream = True
+    elif stream_mode == "force_non_stream":
+        upstream_stream = False
+    else:
+        upstream_stream = client_wants_stream
+
+    if upstream_stream and not client_wants_stream and stream_mode == "force_stream":
+        payload = dict(payload) if not isinstance(payload, dict) else {**payload}
+        payload["stream"] = True
+        logger.info(f"[stream_mode/passthrough] force_stream: client=non-stream, upstream=stream, model={original_model}")
+    elif not upstream_stream and client_wants_stream and stream_mode == "force_non_stream":
+        payload = dict(payload) if not isinstance(payload, dict) else {**payload}
+        payload["stream"] = False
+        logger.info(f"[stream_mode/passthrough] force_non_stream: client=stream, upstream=non-stream, model={original_model}")
+
+    # Gemini/Vertex URL 适配
+    if upstream_stream and "generateContent" in url and "streamGenerateContent" not in url:
+        url = url.replace("generateContent", "streamGenerateContent")
+    elif not upstream_stream and "streamGenerateContent" in url:
+        url = url.replace("streamGenerateContent", "generateContent")
+
+    # 修改原因：Vertex AI streamGenerateContent 不带 ?alt=sse 时返回 JSON 数组而非 SSE 流，
+    #   导致 LoggingStreamingResponse 无法按行解析 usage，stream_guard 因 completion_tokens=0 把 200 误判为 502。
+    # 修改方式：透传流式请求的 URL 含 streamGenerateContent 时自动追加 ?alt=sse。
+    # 目的：让 Vertex/Gemini 原生 passthrough 返回标准 SSE 格式，与现有 SSE 解析管道兼容。
+    if upstream_stream and "streamGenerateContent" in url and "alt=sse" not in url:
+        url += "&alt=sse" if "?" in url else "?alt=sse"
+
+    try:
+        async with app.state.client_manager.get_client(url, proxy) as client:
+            last_message_role = safe_get(request, "messages", -1, "role", default=None)
+
+            if upstream_stream:
+                # 修改原因：AWS Bedrock 透传流式响应不是普通 SSE，默认处理器无法解析二进制事件流。
+                # 修改方式：若渠道注册了 passthrough_stream_adapter，则优先使用渠道专用处理器。
+                # 目的：只让需要特殊解码的渠道接管透传响应读取，其他渠道继续走通用原样转发。
+                if channel and getattr(channel, "passthrough_stream_adapter", None):
+                    raw_generator = channel.passthrough_stream_adapter(
+                        client, url, headers, payload, original_model, timeout_value
+                    )
+
+                    async def passthrough_stream_adapter_with_outbound():
+                        from .response import _apply_response_path_interceptors
+                        # 修改原因：专用透传流式 adapter 不经过 _fetch_passthrough_stream，旧逻辑会绕过 response 和新增出站阶段。
+                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
+                        # 目的：让 AWS Bedrock 等专用透传流式响应也覆盖 channel_outbound 和 key_outbound。
+                        try:
+                            async for chunk in raw_generator:
+                                yield await _apply_response_path_interceptors(
+                                    chunk, engine, request.model, is_stream=True,
+                                    enabled_plugins=enabled_plugins,
+                                    provider=provider,
+                                    api_key_info=api_key_info,
+                                    key_enabled_plugins=key_enabled_plugins,
+                                )
+                        finally:
+                            await close_async_iterator(raw_generator)
+
+                    generator = passthrough_stream_adapter_with_outbound()
+                else:
+                    # 透传模式：使用原始流处理，不做格式转换
+                    generator = _fetch_passthrough_stream(
+                        client, url, headers, payload, timeout_value,
+                        engine=engine, model=request.model,
+                        enabled_plugins=enabled_plugins,
+                        provider=provider,
+                        api_key_info=api_key_info,
+                        key_enabled_plugins=key_enabled_plugins,
+                    )
+                # 使用简单的透传错误包装器，不做 JSON 解析
+                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                    generator, channel_id, keepalive_interval=keepalive_interval,
+                    stream_header_timeout=stream_header_timeout,
+                    current_info=current_info,
+                    engine=engine,
+                )
+
+                if client_wants_stream:
+                    response = LoggingStreamingResponse(
+                        wrapped_generator,
+                        media_type="text/event-stream",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+                else:
+                    # force_stream 透传：上游流式 → 拼装成非流式 JSON
+                    from .stream_convert import assemble_stream_to_json
+                    assembled = await assemble_stream_to_json(wrapped_generator)
+                    error = current_info.get("_stream_error") or extract_stream_error(assembled)
+                    if error:
+                        raise UpstreamStreamError(error)
+
+                    async def force_stream_passthrough_iter():
+                        yield json.dumps(assembled, ensure_ascii=False)
+
+                    response = LoggingStreamingResponse(
+                        force_stream_passthrough_iter(),
+                        media_type="application/json",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+            else:
+                # 修改原因：少数渠道需要在透传非流式路径中复用自己的上游响应读取逻辑。
+                # 修改方式：若渠道注册了 passthrough_response_adapter，则优先调用该处理器。
+                # 目的：让 AWS Bedrock 的 invoke 响应可以与流式透传一样收敛在 AWS channel 内。
+                if channel and getattr(channel, "passthrough_response_adapter", None):
+                    raw_generator = channel.passthrough_response_adapter(
+                        client, url, headers, payload, original_model, timeout_value
+                    )
+
+                    async def passthrough_response_adapter_with_outbound():
+                        from .response import _apply_response_path_interceptors
+                        # 修改原因：专用透传非流式 adapter 不经过 _fetch_passthrough_response，旧逻辑会绕过 response 和新增出站阶段。
+                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
+                        # 目的：让 AWS Bedrock 等专用透传非流式响应也覆盖 channel_outbound 和 key_outbound。
+                        try:
+                            async for chunk in raw_generator:
+                                yield await _apply_response_path_interceptors(
+                                    chunk, engine, request.model, is_stream=False,
+                                    enabled_plugins=enabled_plugins,
+                                    provider=provider,
+                                    api_key_info=api_key_info,
+                                    key_enabled_plugins=key_enabled_plugins,
+                                )
+                        finally:
+                            await close_async_iterator(raw_generator)
+
+                    generator = passthrough_response_adapter_with_outbound()
+                else:
+                    # 透传模式：使用原始响应处理，不做格式转换
+                    generator = _fetch_passthrough_response(
+                        client, url, headers, payload, timeout_value,
+                        engine=engine, model=request.model,
+                        enabled_plugins=enabled_plugins,
+                        provider=provider,
+                        api_key_info=api_key_info,
+                        key_enabled_plugins=key_enabled_plugins,
+                    )
+                # 使用简单的透传错误包装器，不做 JSON 解析
+                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                    generator, channel_id, stream=False, current_info=current_info
+                )
+
+                if client_wants_stream:
+                    # force_non_stream 透传：上游非流式 → 拆成 SSE
+                    from .stream_convert import convert_json_to_sse
+
+                    async def force_non_stream_passthrough_iter():
+                        raw = b""
+                        async for chunk in wrapped_generator:
+                            raw += chunk if isinstance(chunk, bytes) else chunk.encode()
+                        async for sse_line in convert_json_to_sse(raw):
+                            yield sse_line
+
+                    response = LoggingStreamingResponse(
+                        force_non_stream_passthrough_iter(),
+                        media_type="text/event-stream",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+                else:
+                    response = LoggingStreamingResponse(
+                        wrapped_generator,
+                        media_type="application/json",
+                        current_info=current_info,
+                        app=app,
+                        debug=is_debug,
+                    )
+
+            current_info["first_response_time"] = first_response_time
+    except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
+            httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
+            httpx.ConnectError) as e:
+        _fire_and_forget_channel_stats(
+            update_channel_stats_func,
+            current_info["request_id"],
+            channel_id,
+            request.model,
+            current_info["api_key"],
+            success=False,
+            provider_api_key=original_api_key,
+        )
+        raise e
+
+    response.headers["x-zoaholic-passthrough"] = "request"
+
+    # 与转换路径一致，流式响应等待实际发送结束再提交渠道统计。
+    stats_args = (current_info["request_id"], channel_id, request.model, current_info["api_key"])
+    if response.media_type == "text/event-stream":
+        current_info["_channel_stats_call"] = (
+            update_channel_stats_func, stats_args, {"provider_api_key": original_api_key},
+        )
+    else:
+        _fire_and_forget_channel_stats(
+            update_channel_stats_func, *stats_args, success=True, provider_api_key=original_api_key,
+        )
+    current_info["success"] = True
+    current_info["status_code"] = 200
+    current_info["provider"] = channel_id
+
+    return response

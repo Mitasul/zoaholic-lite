@@ -1,0 +1,126 @@
+name: Build and Release PEX
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-pex-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pex
+
+      - name: Resolve Version
+        id: resolve_version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(grep -E '^version\s*=\s*"' pyproject.toml | head -n 1 | cut -d'"' -f2)
+          fi
+
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Failed to resolve version"
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Resolved VERSION=$VERSION"
+
+      - name: Export dependencies (requirements.txt)
+        shell: bash
+        run: |
+          # 修改原因：uv export 默认把项目自身导出为可编辑依赖 "-e ."，pex 无法解析该条目，导致 v1.7.5 起所有 tag 的 PEX 构建失败。
+          # 修改方式：导出时加 --no-emit-project 跳过项目自身，pex 已通过 -D . 打包仓库目录，无需在 requirements 中重复声明。
+          uv export --format requirements-txt --no-dev --no-emit-project -o requirements.txt
+          echo "Exported requirements.txt:"
+          head -n 50 requirements.txt
+
+      - name: Build PEX
+        shell: bash
+        run: |
+          OUT="zoaholic-${{ matrix.platform }}-${{ matrix.arch }}-${VERSION}.pex"
+
+          pex -D . -r requirements.txt \
+            -c uvicorn \
+            --inject-args 'main:app --host 0.0.0.0 --port 8000' \
+            --interpreter-constraint '==3.11.*' \
+            -o "$OUT"
+
+          ls -lh "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pex-${{ matrix.platform }}-${{ matrix.arch }}
+          path: zoaholic-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          ls -R dist
+
+      - name: Create GitHub Release (upload all PEX)
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/**/*.pex

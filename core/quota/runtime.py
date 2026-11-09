@@ -1,0 +1,1103 @@
+"""Scope × Metric 正交化配额运行时。
+
+修改原因：旧运行时为 request、cost、token、token_in、token_out、ip_rate 分别维护多套字典，新增任意作用域和度量组合都会继续复制代码。
+修改方式：新增 ScopedStore，所有普通计数都用 (scope_id, metric_name) 作为统一 key；QuotaCounter 只负责把 Rule 映射到 scope_id 和读写类型。
+目的：让 key、per-IP、per-model 的 request/cost/token 配额复用同一套检查、记录和状态输出逻辑，同时保留 unique_ip 的特殊去重语义。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+from collections import defaultdict, deque
+from time import time
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+from .parser import Limit, Metric, Rule, Scope, WindowType
+from .dimensional import DimensionalQuotaCounter, parse_dimensional_rules
+
+logger = logging.getLogger('Zoaholic')
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SNAPSHOT_PATH = os.path.join(_PROJECT_ROOT, 'data', 'runtime_quota_snapshot.json')
+
+
+# ──────────────────────────────────────────────
+# 内部计数器
+# ──────────────────────────────────────────────
+
+class _SlidingCounter:
+    """滑动窗口：存时间戳，count = 窗口内条目数。"""
+
+    __slots__ = ('_q',)
+
+    def __init__(self):
+        self._q: deque = deque(maxlen=50000)
+
+    def add(self, now: float):
+        self._q.append(now)
+
+    def count(self, now: float, period: float) -> int:
+        if math.isinf(period):
+            return len(self._q)
+        cutoff = now - period
+        return sum(1 for t in self._q if t > cutoff)
+
+    def clear(self):
+        self._q.clear()
+
+    def cleanup(self, now: float, max_period: float):
+        if math.isinf(max_period):
+            return
+        cutoff = now - max_period
+        while self._q and self._q[0] <= cutoff:
+            self._q.popleft()
+
+
+class _SlidingAccumulator:
+    """滑动窗口：存 (timestamp, amount)，total = 窗口内累加值。"""
+
+    __slots__ = ('_q', '_perm')
+
+    def __init__(self):
+        self._q: deque = deque(maxlen=200000)
+        self._perm: float = 0.0
+
+    def add(self, now: float, amount: float):
+        self._q.append((now, amount))
+        self._perm += amount
+
+    def total(self, now: float, period: float) -> float:
+        if math.isinf(period):
+            return self._perm
+        cutoff = now - period
+        return sum(a for t, a in self._q if t > cutoff)
+
+    def clear(self):
+        self._q.clear()
+        self._perm = 0.0
+
+    def cleanup(self, now: float, max_period: float):
+        if math.isinf(max_period):
+            return
+        cutoff = now - max_period
+        while self._q and self._q[0][0] <= cutoff:
+            self._q.popleft()
+
+    def set_permanent(self, total: float):
+        """从 DB 恢复永久累计值（重启后调用）。"""
+        self._perm = total
+
+
+class _FixedWindow:
+    """固定窗口：到期重置。"""
+
+    __slots__ = ('val', 'start')
+
+    def __init__(self):
+        self.val: float = 0
+        self.start: float = 0
+
+    def get(self, now: float, period: float) -> float:
+        if math.isinf(period):
+            return self.val
+        if self.start == 0 or now >= self.start + period:
+            return 0
+        return self.val
+
+    def increment(self, now: float, period: float, amount: float = 1):
+        if not math.isinf(period) and (self.start == 0 or now >= self.start + period):
+            self.val = 0
+            self.start = now
+        self.val += amount
+
+    def clear(self):
+        self.val = 0
+        self.start = 0
+
+    def resets_at(self, period: float) -> Optional[float]:
+        if math.isinf(period) or self.start == 0:
+            return None
+        return self.start + period
+
+
+class _FixedUniqueWindow:
+    """固定窗口内的 IP 去重集合。"""
+
+    __slots__ = ('seen', 'start')
+
+    def __init__(self):
+        self.seen: Set[str] = set()
+        self.start: float = 0
+
+    def _ensure_window(self, now: float, period: float):
+        if not math.isinf(period) and (self.start == 0 or now >= self.start + period):
+            self.seen.clear()
+            self.start = now
+
+    def count(self, now: float, period: float) -> int:
+        self._ensure_window(now, period)
+        return len(self.seen)
+
+    def contains(self, now: float, period: float, ip: str) -> bool:
+        self._ensure_window(now, period)
+        return ip in self.seen
+
+    def add(self, now: float, period: float, ip: str):
+        self._ensure_window(now, period)
+        self.seen.add(ip)
+
+    def clear(self):
+        self.seen.clear()
+        self.start = 0
+
+    def resets_at(self, period: float) -> Optional[float]:
+        if math.isinf(period) or self.start == 0:
+            return None
+        return self.start + period
+
+
+class ScopedStore:
+    """统一计数器存储。key = (scope_id, metric_name)。"""
+
+    def __init__(self):
+        self._sliding: Dict[Tuple[str, str], Union[_SlidingCounter, _SlidingAccumulator]] = {}
+        self._fixed: Dict[Tuple[str, str], Dict[float, _FixedWindow]] = {}
+
+    def get_or_create_counter(self, scope_id: str, metric: str) -> _SlidingCounter:
+        key = (scope_id, metric)
+        existing = self._sliding.get(key)
+        if existing is None:
+            existing = _SlidingCounter()
+            self._sliding[key] = existing
+        if not isinstance(existing, _SlidingCounter):
+            raise TypeError(f"ScopedStore key {key!r} is not a counter")
+        return existing
+
+    def get_or_create_accumulator(self, scope_id: str, metric: str) -> _SlidingAccumulator:
+        key = (scope_id, metric)
+        existing = self._sliding.get(key)
+        if existing is None:
+            existing = _SlidingAccumulator()
+            self._sliding[key] = existing
+        if not isinstance(existing, _SlidingAccumulator):
+            raise TypeError(f"ScopedStore key {key!r} is not an accumulator")
+        return existing
+
+    def get_fixed_window(self, scope_id: str, metric: str, period: float) -> _FixedWindow:
+        key = (scope_id, metric)
+        if key not in self._fixed:
+            self._fixed[key] = {}
+        if period not in self._fixed[key]:
+            self._fixed[key][period] = _FixedWindow()
+        return self._fixed[key][period]
+
+    def scope_ids_for_metric(self, metric: str) -> Set[str]:
+        """返回某个 metric 下已经出现过的 scope_id。"""
+
+        ids = {scope_id for (scope_id, metric_name) in self._sliding.keys() if metric_name == metric}
+        ids.update(scope_id for (scope_id, metric_name) in self._fixed.keys() if metric_name == metric)
+        return ids
+
+    def reset_scope_metric(self, scope_predicate, metric_name: str) -> int:
+        """重置指定 scope_id 与 metric 的所有滑动和固定计数器。"""
+
+        affected = 0
+        for key, counter in list(self._sliding.items()):
+            scope_id, stored_metric = key
+            if stored_metric == metric_name and scope_predicate(scope_id):
+                counter.clear()
+                affected += 1
+        for key, windows in list(self._fixed.items()):
+            scope_id, stored_metric = key
+            if stored_metric == metric_name and scope_predicate(scope_id):
+                for window in windows.values():
+                    window.clear()
+                affected += len(windows) or 1
+        return affected
+
+    def cleanup(self, now: float, max_periods: Dict[str, float]):
+        """清理普通滑动窗口。"""
+
+        # 修改原因：ScopedStore 不再知道 Rule 结构，只能按 metric_name 接收外层计算好的最大保留窗口。
+        # 修改方式：QuotaCounter 汇总每个 metric 的最大有限 period 后传入，store 只负责按类型调用 cleanup。
+        # 目的：保留旧运行时的周期清理能力，同时避免 store 反向依赖 parser 规则。
+        for (scope_id, metric_name), counter in list(self._sliding.items()):
+            max_period = max_periods.get(metric_name, 3600)
+            counter.cleanup(now, max_period)
+
+
+# ──────────────────────────────────────────────
+# QuotaCounter
+# ──────────────────────────────────────────────
+
+_ACCUMULATOR_METRICS = {Metric.COST, Metric.TOKEN, Metric.TOKEN_IN, Metric.TOKEN_OUT}
+_TOKEN_METRICS = {Metric.TOKEN, Metric.TOKEN_IN, Metric.TOKEN_OUT}
+_ALL_METRICS = [Metric.REQUEST, Metric.COST, Metric.TOKEN, Metric.TOKEN_IN, Metric.TOKEN_OUT, Metric.UNIQUE_IP]
+_LABEL_QUALIFIERS = {'default', 'daily', 'day', 'hourly', 'hour', 'weekly', 'week', 'monthly', 'month', 'yearly', 'year'}
+
+
+class QuotaCounter:
+    """单个 API Key 的配额执行器。"""
+
+    def __init__(self, rules: List[Rule]):
+        self.rules = rules
+        self._by_metric: Dict[Metric, List[Rule]] = defaultdict(list)
+        for rule in rules:
+            self._by_metric[rule.metric].append(rule)
+
+        self._store = ScopedStore()
+        # 修改原因：unique_ip 的计数对象不是普通数值，而是窗口内去重 IP 集合。
+        # 修改方式：滑动窗口用 ip -> last_seen，固定窗口按 period 维护独立 set。
+        # 目的：保持 IP 数量上限的特殊语义，同时不污染普通 ScopedStore 计数结构。
+        self._ip_seen: Dict[str, float] = {}
+        self._ip_fixed: Dict[float, _FixedUniqueWindow] = {}
+        self._ops = 0
+        self._snapshot_dirty = False
+
+    # ── 公开 API ──
+
+    def check_request(self, model: str = 'default', client_ip: str = '', *, record: bool = True) -> Optional[str]:
+        """请求前检查 + 记录。None = 放行，str = 拒绝原因。"""
+
+        now = time()
+        self._ops += 1
+        if self._ops % 200 == 0:
+            self._cleanup(now)
+
+        normalized_model = model or 'default'
+        normalized_ip = client_ip or ''
+
+        # 修改原因：新模型要求 request、cost、token、unique_ip 都按 Rule 的 scope × metric 统一检查。
+        # 修改方式：遍历所有规则，由 _scope_id_for_rule 判断本次请求是否命中该规则，再按 metric 类型读取当前值。
+        # 目的：让 key 级、per-IP 和 model 级限制都能在请求进入上游前拦截。
+        for metric in _ALL_METRICS:
+            for rule in self._by_metric.get(metric, []):
+                reason = self._check_rule(rule, normalized_model, normalized_ip, now)
+                if reason:
+                    return reason
+
+        if record:
+            self.record_request(normalized_model, normalized_ip, now=now)
+        return None
+
+    def record_request(self, model: str = 'default', client_ip: str = '', *, now=None):
+        now = time() if now is None else now
+        self._record_metric_event(Metric.REQUEST, 1, model or 'default', client_ip or '', now)
+        self._record_unique_ip(client_ip or '', now)
+
+    def is_exhausted(self, model: str = 'default') -> bool:
+        """只检查 key 级 cost/token 是否耗尽（不记录、不检查 request 限速）。"""
+
+        now = time()
+        normalized_model = model or 'default'
+        for metric in (Metric.COST, Metric.TOKEN, Metric.TOKEN_IN, Metric.TOKEN_OUT):
+            for rule in self._by_metric.get(metric, []):
+                if rule.scope != Scope.KEY:
+                    continue
+                reason = self._check_rule(rule, normalized_model, '', now)
+                if reason:
+                    return True
+        return False
+
+    def record_usage(self, model: str, cost: float = 0.0, tokens: int = 0,
+                     tokens_in: int = 0, tokens_out: int = 0, client_ip: str = ''):
+        """请求完成后记录 cost / token 用量。"""
+
+        now = time()
+        normalized_model = model or 'default'
+        normalized_ip = client_ip or ''
+        # 修改原因：per-IP cost/token 需要在请求完成后按客户端 IP 累加，旧接口没有 client_ip 无法定位 scope_id。
+        # 修改方式：record_usage 接收 client_ip，并对每个 metric 调用同一套 _record_metric_event。
+        # 目的：让 key scope 和 ip scope 的 cost/token/token_in/token_out 使用同一条记录路径。
+        if cost > 0:
+            self._record_metric_event(Metric.COST, float(cost), normalized_model, normalized_ip, now)
+        if tokens > 0:
+            self._record_metric_event(Metric.TOKEN, float(tokens), normalized_model, normalized_ip, now)
+        if tokens_in > 0:
+            self._record_metric_event(Metric.TOKEN_IN, float(tokens_in), normalized_model, normalized_ip, now)
+        if tokens_out > 0:
+            self._record_metric_event(Metric.TOKEN_OUT, float(tokens_out), normalized_model, normalized_ip, now)
+
+    def get_status(self, model: str = 'default') -> dict:
+        """获取当前配额状态（供 API 返回）。"""
+
+        now = time()
+        normalized_model = model or 'default'
+        out: dict = {}
+        for rule in self.rules:
+            if rule.scope == Scope.MODEL and normalized_model != 'default' and not _model_match(rule.qualifier, normalized_model):
+                continue
+            for limit in rule.limits:
+                status_key = f"{rule.scope.value}:{rule.metric.value}:{rule.qualifier}"
+                if rule.metric == Metric.UNIQUE_IP:
+                    current = self._unique_ip_count(limit, now)
+                    reset_at = self._unique_ip_reset_at(limit, now)
+                    out[status_key] = _status(current, limit, reset_at=reset_at, now=now)
+                    continue
+                if rule.scope == Scope.IP:
+                    out[status_key] = self._aggregate_ip_status(rule.metric, limit, now)
+                    continue
+                if rule.scope == Scope.MODEL:
+                    out[status_key] = self._aggregate_model_status(rule.qualifier, limit, now)
+                    continue
+                scope_id = self._scope_id_for_rule(rule, normalized_model, '', for_status=True)
+                out[status_key] = self._status_for_scope(scope_id or 'key', rule.metric, limit, now)
+        return out
+
+    def get_ip_breakdown(self, client_ip: str) -> List[dict]:
+        """返回旧 ip:* 规则在指定 IP 上的实时额度，供分析面板展示。"""
+        if not client_ip:
+            return []
+        now = time()
+        output = []
+        for rule in self.rules:
+            if rule.scope != Scope.IP:
+                continue
+            statuses = []
+            scope_id = f"ip:{client_ip}"
+            store_key = (scope_id, rule.metric.value)
+            has_runtime_bucket = store_key in self._store._sliding or store_key in self._store._fixed
+            for limit in rule.limits:
+                status = (
+                    self._status_for_scope(scope_id, rule.metric, limit, now)
+                    if has_runtime_bucket else _status(0, limit, now=now)
+                )
+                status["measure"] = rule.metric.value
+                status["aggregate"] = "count" if rule.metric == Metric.REQUEST else "sum"
+                status["remaining_ratio"] = (
+                    max(0.0, min(1.0, float(status.get("remaining", 0)) / float(status.get("limit", 0))))
+                    if float(status.get("limit", 0)) > 0 else 0.0
+                )
+                statuses.append(status)
+            worst = min(statuses, key=lambda item: item.get("remaining_ratio", 1.0)) if statuses else {}
+            output.append({
+                "id": f"legacy_ip_{rule.metric.value}_{rule.qualifier}",
+                "group_by": ["ip"],
+                "where": {},
+                "measure": rule.metric.value,
+                "aggregate": "count" if rule.metric == Metric.REQUEST else "sum",
+                "label": "",
+                "buckets": [{
+                    "dimensions": {"ip": client_ip},
+                    "current": worst.get("current", 0),
+                    "limit": worst.get("limit", 0),
+                    "remaining": worst.get("remaining", 0),
+                    "remaining_ratio": worst.get("remaining_ratio", 1.0),
+                    "limits": statuses,
+                }],
+            })
+        return output
+
+    def get_ip_summary(self, client_ip: str) -> Optional[dict]:
+        breakdown = self.get_ip_breakdown(client_ip)
+        limits = [limit for rule in breakdown for bucket in rule["buckets"] for limit in bucket["limits"]]
+        if not limits:
+            return None
+        worst = min(limits, key=lambda item: item.get("remaining_ratio", 1.0))
+        return {
+            "remaining_ratio": worst.get("remaining_ratio", 1.0),
+            "exhausted": any(item.get("remaining", 0) <= 0 for item in limits),
+            "rule_count": len(breakdown),
+            "bucket_count": len(breakdown),
+            "label": worst.get("label", ""),
+            "measure": worst.get("measure", ""),
+            "current": worst.get("current", 0),
+            "limit": worst.get("limit", 0),
+            "remaining": worst.get("remaining", 0),
+        }
+
+    def reset_status(self, status_key: str) -> dict:
+        """按状态 key 手动清零一条正交配额。"""
+
+        # 修改原因：管理端需要对每个 Scope × Metric 状态提供手动重置按钮。
+        # 修改方式：沿用 get_status 输出的 status_key，定位到底层 scope_id 与 metric 计数器后清零。
+        # 目的：避免通过保存配置或重启服务来间接重置额度，同时保持 Key、Per-IP、模型三个作用域统一。
+        scope, metric, qualifier = _parse_status_key(status_key)
+        affected = 0
+        if metric == Metric.UNIQUE_IP:
+            affected = self._reset_unique_ip()
+        elif scope == Scope.KEY:
+            affected = self._store.reset_scope_metric(lambda scope_id: scope_id == 'key', metric.value)
+        elif scope == Scope.IP:
+            affected = self._store.reset_scope_metric(lambda scope_id: scope_id.startswith('ip:') and scope_id != 'ip:', metric.value)
+        elif scope == Scope.MODEL:
+            affected = self._reset_model_metric(qualifier, metric)
+        else:
+            raise ValueError(f"Unsupported quota scope: {scope}")
+
+        self._snapshot_dirty = True
+        return {
+            'status_key': status_key,
+            'scope': scope.value,
+            'metric': metric.value,
+            'qualifier': qualifier,
+            'affected': affected,
+        }
+
+    # ── 检查 ──
+
+    def _check_rule(self, rule: Rule, model: str, client_ip: str, now: float) -> Optional[str]:
+        if rule.metric == Metric.UNIQUE_IP:
+            return self._check_unique_ip(rule, client_ip, now)
+        scope_id = self._scope_id_for_rule(rule, model, client_ip)
+        if not scope_id:
+            return None
+        for limit in rule.limits:
+            current = self._read_metric(scope_id, rule.metric, limit, now)
+            if current >= limit.value:
+                return _limit_message(rule, current, limit)
+        return None
+
+    def _check_unique_ip(self, rule: Rule, client_ip: str, now: float) -> Optional[str]:
+        if not client_ip:
+            return None
+        for limit in rule.limits:
+            current = self._unique_ip_count(limit, now)
+            already_seen = self._unique_ip_contains(limit, client_ip, now)
+            if not already_seen and current >= limit.value:
+                return f"Too many IPs (max {int(limit.value)})"
+        return None
+
+    # ── 记录 ──
+
+    def _record_metric_event(self, metric: Metric, amount: float, model: str, client_ip: str, now: float):
+        sliding_done: Set[Tuple[str, str]] = set()
+        fixed_done: Set[Tuple[str, str, float]] = set()
+        for rule in self._by_metric.get(metric, []):
+            scope_id = self._scope_id_for_rule(rule, model, client_ip)
+            if not scope_id:
+                continue
+            for limit in rule.limits:
+                metric_name = metric.value
+                if limit.window == WindowType.SLIDING:
+                    key = (scope_id, metric_name)
+                    if key in sliding_done:
+                        continue
+                    if metric == Metric.REQUEST:
+                        self._store.get_or_create_counter(scope_id, metric_name).add(now)
+                    else:
+                        self._store.get_or_create_accumulator(scope_id, metric_name).add(now, amount)
+                        if any(math.isinf(item.period) for item in rule.limits):
+                            self._snapshot_dirty = True
+                    sliding_done.add(key)
+                else:
+                    key = (scope_id, metric_name, limit.period)
+                    if key in fixed_done:
+                        continue
+                    increment = 1 if metric == Metric.REQUEST else amount
+                    window = self._store.get_fixed_window(scope_id, metric_name, limit.period)
+                    window.increment(now, limit.period, increment)
+                    self._snapshot_dirty = True
+                    fixed_done.add(key)
+
+    def _record_unique_ip(self, client_ip: str, now: float):
+        if not client_ip or not self._by_metric.get(Metric.UNIQUE_IP):
+            return
+        self._ip_seen[client_ip] = now
+        for rule in self._by_metric.get(Metric.UNIQUE_IP, []):
+            for limit in rule.limits:
+                if limit.window == WindowType.FIXED:
+                    window = self._ip_fixed_window(limit.period)
+                    old_start = window.start
+                    window.add(now, limit.period, client_ip)
+                    if window.start != old_start:
+                        self._snapshot_dirty = True
+
+    # ── 读取 ──
+
+    def _scope_id_for_rule(self, rule: Rule, model: str, client_ip: str, for_status: bool = False) -> Optional[str]:
+        if rule.scope == Scope.KEY:
+            if rule.metric in _TOKEN_METRICS and not _key_metric_qualifier_matches(rule.qualifier, model):
+                return None
+            return 'key'
+        if rule.scope == Scope.IP:
+            return f"ip:{client_ip}" if client_ip else (None if not for_status else 'ip:')
+        if rule.scope == Scope.MODEL:
+            if _model_match(rule.qualifier, model):
+                return f"model:{model}"
+            return None
+        return None
+
+    def _read_metric(self, scope_id: str, metric: Metric, limit: Limit, now: float) -> float:
+        metric_name = metric.value
+        if limit.window == WindowType.FIXED:
+            return self._store.get_fixed_window(scope_id, metric_name, limit.period).get(now, limit.period)
+        if metric == Metric.REQUEST:
+            return self._store.get_or_create_counter(scope_id, metric_name).count(now, limit.period)
+        if metric in _ACCUMULATOR_METRICS:
+            return self._store.get_or_create_accumulator(scope_id, metric_name).total(now, limit.period)
+        return 0
+
+    def _status_for_scope(self, scope_id: str, metric: Metric, limit: Limit, now: float) -> dict:
+        metric_name = metric.value
+        current = self._read_metric(scope_id, metric, limit, now)
+        reset_at = None
+        if limit.window == WindowType.FIXED:
+            reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        return _status(current, limit, reset_at=reset_at, now=now)
+
+    def _aggregate_ip_status(self, metric: Metric, limit: Limit, now: float) -> dict:
+        # 修改原因：ip scope 的真实计数分散在 ip:{client_ip} 多个 scope_id 下，API 不能为每个 IP 生成动态顶层 key。
+        # 修改方式：状态聚合为同一 key（如 ip:cost:default），current 使用最接近触发限制的单个 IP 最大值，并附加 subjects 数量。
+        # 目的：前端可以稳定展示 per-IP 规则，同时仍能看到当前最紧张的 IP 使用量。
+        metric_name = metric.value
+        scope_ids = sorted(sid for sid in self._store.scope_ids_for_metric(metric_name) if sid.startswith('ip:') and sid != 'ip:')
+        best_current = 0
+        best_reset_at = None
+        for scope_id in scope_ids:
+            current = self._read_metric(scope_id, metric, limit, now)
+            if current >= best_current:
+                best_current = current
+                best_reset_at = None
+                if limit.window == WindowType.FIXED:
+                    best_reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        data = _status(best_current, limit, reset_at=best_reset_at, now=now)
+        data['aggregate'] = 'max'
+        data['subjects'] = len(scope_ids)
+        return data
+
+    def _aggregate_model_status(self, qualifier: str, limit: Limit, now: float) -> dict:
+        metric_name = Metric.REQUEST.value
+        scope_ids = sorted(
+            sid for sid in self._store.scope_ids_for_metric(metric_name)
+            if sid.startswith('model:') and _model_match(qualifier, sid.split(':', 1)[1])
+        )
+        active_scope_ids = set(self._store.scope_ids_for_metric(metric_name))
+        if not scope_ids:
+            scope_ids = [f"model:{qualifier}"]
+        best_current = 0
+        best_reset_at = None
+        for scope_id in scope_ids:
+            current = self._read_metric(scope_id, Metric.REQUEST, limit, now)
+            if current >= best_current:
+                best_current = current
+                best_reset_at = None
+                if limit.window == WindowType.FIXED:
+                    best_reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        data = _status(best_current, limit, reset_at=best_reset_at, now=now)
+        data['aggregate'] = 'max'
+        data['subjects'] = len([sid for sid in scope_ids if sid in active_scope_ids])
+        return data
+
+    def _unique_ip_count(self, limit: Limit, now: float) -> int:
+        if limit.window == WindowType.FIXED:
+            return self._ip_fixed_window(limit.period).count(now, limit.period)
+        if math.isinf(limit.period):
+            return len(self._ip_seen)
+        cutoff = now - limit.period
+        return sum(1 for last_seen in self._ip_seen.values() if last_seen > cutoff)
+
+    def _unique_ip_contains(self, limit: Limit, client_ip: str, now: float) -> bool:
+        if limit.window == WindowType.FIXED:
+            return self._ip_fixed_window(limit.period).contains(now, limit.period, client_ip)
+        if math.isinf(limit.period):
+            return client_ip in self._ip_seen
+        return self._ip_seen.get(client_ip, 0) > now - limit.period
+
+    def _unique_ip_reset_at(self, limit: Limit, now: float) -> Optional[float]:
+        if limit.window != WindowType.FIXED:
+            return None
+        return self._ip_fixed_window(limit.period).resets_at(limit.period)
+
+    def _reset_unique_ip(self) -> int:
+        affected = len(self._ip_seen) + len(self._ip_fixed)
+        self._ip_seen.clear()
+        for window in self._ip_fixed.values():
+            window.clear()
+        return affected
+
+    def _reset_model_metric(self, qualifier: str, metric: Metric) -> int:
+        metric_name = metric.value
+        known_scope_ids = self._store.scope_ids_for_metric(metric_name)
+        matched = {
+            scope_id for scope_id in known_scope_ids
+            if scope_id.startswith('model:') and _model_match(qualifier, scope_id.split(':', 1)[1])
+        }
+        matched.add(f"model:{qualifier}")
+        return self._store.reset_scope_metric(lambda scope_id: scope_id in matched, metric_name)
+
+    def _ip_fixed_window(self, period: float) -> _FixedUniqueWindow:
+        if period not in self._ip_fixed:
+            self._ip_fixed[period] = _FixedUniqueWindow()
+        return self._ip_fixed[period]
+
+    # ── 快照 ──
+
+    def _snapshot(self) -> dict:
+        """导出固定窗口状态。"""
+        snap: dict = {'fixed': [], 'ip_fixed': [], 'permanent': []}
+        for (scope_id, metric), counter in self._store._sliding.items():
+            if isinstance(counter, _SlidingAccumulator) and counter._perm:
+                snap['permanent'].append({'s': scope_id, 'm': metric, 'v': counter._perm})
+        for (scope_id, metric_name), windows in self._store._fixed.items():
+            for period, window in windows.items():
+                if window.start > 0:
+                    snap['fixed'].append({
+                        's': scope_id, 'm': metric_name, 'p': period,
+                        'v': window.val, 't': window.start,
+                    })
+        for period, uw in self._ip_fixed.items():
+            if uw.start > 0:
+                snap['ip_fixed'].append({
+                    'p': period, 'ips': sorted(uw.seen), 't': uw.start,
+                })
+        return snap
+
+    def _restore_snapshot(self, snap: dict):
+        """从快照恢复固定窗口状态（跳过已过期窗口）。"""
+        now = time()
+        restored = 0
+        for entry in snap.get('permanent', []):
+            self._store.get_or_create_accumulator(entry['s'], entry['m']).set_permanent(entry['v'])
+            restored += 1
+        for entry in snap.get('fixed', []):
+            scope_id = entry.get('s', '')
+            metric = entry.get('m', '')
+            period = entry.get('p', 0)
+            val = entry.get('v', 0)
+            start = entry.get('t', 0)
+            if not scope_id or not metric or period <= 0 or start <= 0:
+                continue
+            if not math.isinf(period) and now >= start + period:
+                continue
+            window = self._store.get_fixed_window(scope_id, metric, period)
+            window.val = val
+            window.start = start
+            restored += 1
+        for entry in snap.get('ip_fixed', []):
+            period = entry.get('p', 0)
+            ips = entry.get('ips', [])
+            start = entry.get('t', 0)
+            if period <= 0 or start <= 0:
+                continue
+            if not math.isinf(period) and now >= start + period:
+                continue
+            uw = self._ip_fixed_window(period)
+            uw.seen = set(ips)
+            uw.start = start
+            restored += 1
+        return restored
+
+    # ── 清理 ──
+
+    def _cleanup(self, now: float):
+        max_periods: Dict[str, float] = {}
+        for metric in _ALL_METRICS:
+            periods = [limit.period for rule in self._by_metric.get(metric, []) for limit in rule.limits if limit.window == WindowType.SLIDING]
+            if not periods:
+                continue
+            finite = [period for period in periods if not math.isinf(period)]
+            max_periods[metric.value] = max(finite) if finite else math.inf
+        self._store.cleanup(now, max_periods)
+
+        unique_periods = [limit.period for rule in self._by_metric.get(Metric.UNIQUE_IP, []) for limit in rule.limits if limit.window == WindowType.SLIDING]
+        finite_unique = [period for period in unique_periods if not math.isinf(period)]
+        if finite_unique:
+            cutoff = now - max(finite_unique)
+            self._ip_seen = {ip: seen_at for ip, seen_at in self._ip_seen.items() if seen_at > cutoff}
+
+
+# ──────────────────────────────────────────────
+# QuotaRegistry
+# ──────────────────────────────────────────────
+
+class QuotaRegistry:
+    """全局配额注册表，管理所有 API Key 的配额计数器。"""
+
+    def __init__(self):
+        self._counters: Dict[str, QuotaCounter] = {}
+        self._global: Optional[QuotaCounter] = None
+        self._dimensional_counters: Dict[str, DimensionalQuotaCounter] = {}
+        self._global_dimensional: Optional[DimensionalQuotaCounter] = None
+        self._ancestors: Dict[str, List[str]] = {}
+        self._key_ids: Dict[str, str] = {}
+        self._credential_aliases: Dict[str, str] = {}
+
+    def init_from_config(self, config: dict):
+        """从应用配置初始化（启动或热更新时调用）。"""
+
+        from .compat import merge_legacy_to_quota
+        from .parser import parse_config as _parse
+
+        pre_snapshot = self._capture_snapshot()
+        old_counters = self._counters.copy()
+        old_dimensional = self._dimensional_counters.copy()
+        old_global = self._global
+        old_global_dimensional = self._global_dimensional
+        old_key_ids = self._key_ids.copy()
+        keys = config.get('api_keys', [])
+        new_key_ids = {key['api']: key['id'] for key in keys if key.get('id')}
+        api_by_id = {identity: api for api, identity in new_key_ids.items()}
+        for api, identity in self._key_ids.items():
+            replacement = api_by_id.get(identity)
+            if replacement and replacement != api:
+                self._credential_aliases[api] = identity
+        self._key_ids = new_key_ids
+        by_id = {key['id']: key for key in keys if key.get('id')}
+        self._ancestors = {}
+        for key in keys:
+            ancestors = []
+            current = key
+            seen = set()
+            while current.get('parent_id'):
+                parent_id = current['parent_id']
+                if parent_id in seen or parent_id not in by_id:
+                    raise ValueError('Invalid API Key hierarchy')
+                seen.add(parent_id)
+                current = by_id[parent_id]
+                ancestors.append(current['api'])
+            self._ancestors[key.get('api', '')] = ancestors
+
+        self._counters.clear()
+        self._global = None
+        self._dimensional_counters.clear()
+        self._global_dimensional = None
+
+        gp = config.get('preferences') or {}
+        gq = merge_legacy_to_quota(gp)
+        if gq:
+            rules = _parse(gq)
+            if rules:
+                self._global = QuotaCounter(rules)
+        global_dimensional_rules = parse_dimensional_rules(gp.get('quota_rules'))
+        if global_dimensional_rules:
+            self._global_dimensional = DimensionalQuotaCounter(global_dimensional_rules)
+
+        for kc in config.get('api_keys', []):
+            api = kc.get('api', '')
+            if not api:
+                continue
+            prefs = kc.get('preferences') or {}
+            q = merge_legacy_to_quota(prefs)
+            if q:
+                rules = _parse(q)
+                if rules:
+                    self._counters[api] = QuotaCounter(rules)
+            dimensional_rules = parse_dimensional_rules(prefs.get('quota_rules'))
+            if dimensional_rules:
+                self._dimensional_counters[api] = DimensionalQuotaCounter(dimensional_rules)
+
+        snapshot = pre_snapshot if pre_snapshot.get('c') or pre_snapshot.get('g') or pre_snapshot.get('d') or pre_snapshot.get('gd') else self._read_snapshot_file()
+        stored_ids = snapshot.get('ids', {})
+        for section in ('c', 'd'):
+            snapshot[section] = {api_by_id.get(stored_ids.get(api), api): value
+                                 for api, value in snapshot.get(section, {}).items()
+                                 if api not in stored_ids or stored_ids[api] in api_by_id}
+        self._apply_snapshot(snapshot)
+        # Hot reload retains sliding windows, including those absent from disk snapshots.
+        for old_api, previous in old_counters.items():
+            if old_api in old_key_ids and old_key_ids[old_api] not in api_by_id:
+                continue
+            api = api_by_id.get(old_key_ids.get(old_api), old_api)
+            current = self._counters.get(api)
+            if current is not None:
+                current._store = previous._store
+                current._ip_seen = previous._ip_seen
+                current._ip_fixed = previous._ip_fixed
+        for old_api, previous in old_dimensional.items():
+            if old_api in old_key_ids and old_key_ids[old_api] not in api_by_id:
+                continue
+            api = api_by_id.get(old_key_ids.get(old_api), old_api)
+            current = self._dimensional_counters.get(api)
+            if current is not None:
+                current._buckets = {key: bucket for key, bucket in previous._buckets.items()
+                                    if key[0] in current._rules and previous._rules[key[0]] == current._rules[key[0]]}
+        if self._global is not None and old_global is not None:
+            self._global._store = old_global._store
+            self._global._ip_seen = old_global._ip_seen
+            self._global._ip_fixed = old_global._ip_fixed
+        if self._global_dimensional is not None and old_global_dimensional is not None:
+            self._global_dimensional._buckets = {
+                key: bucket for key, bucket in old_global_dimensional._buckets.items()
+                if key[0] in self._global_dimensional._rules
+                and old_global_dimensional._rules[key[0]] == self._global_dimensional._rules[key[0]]}
+        self._save_snapshot()
+
+    def _chain_counters(self, api_key: str, ancestor_keys=None, *, api_key_id=None, ancestor_ids=None):
+        ancestors = self._ancestors.get(api_key, []) if ancestor_keys is None else ancestor_keys
+        api_by_id = {identity: api for api, identity in self._key_ids.items()}
+        if api_key_id is not None:
+            identities = [api_key_id, *(ancestor_ids or [])]
+            resolved = [api_by_id[identity] for identity in identities if identity in api_by_id]
+        else:
+            resolved = [key if key in self._key_ids else api_by_id.get(self._credential_aliases.get(key), key)
+                        for key in [api_key, *ancestors]]
+        for key in dict.fromkeys(resolved):
+            for counter in (self._counters.get(key), self._dimensional_counters.get(key)):
+                if counter is not None:
+                    yield key, counter
+
+    def check(self, api_key: str, model: str = 'default', client_ip: str = '') -> Optional[str]:
+        """Check the entire chain before charging any request counter (no awaits)."""
+        counters = [('global', counter) for counter in (self._global, self._global_dimensional)
+                    if counter is not None]
+        counters.extend(self._chain_counters(api_key))
+        for owner, counter in counters:
+            reason = counter.check_request(model, client_ip, record=False)
+            if reason:
+                self._check_and_save()
+                scope = '[global] ' if owner == 'global' else ('[ancestor] ' if owner != api_key else '')
+                return scope + reason
+        for _, counter in counters:
+            counter.record_request(model, client_ip)
+        self._check_and_save()
+        return None
+
+    def is_exhausted(self, api_key: str, model: str = 'default') -> bool:
+        return any(counter.is_exhausted(model) for _, counter in self._chain_counters(api_key))
+
+    def record_usage(self, api_key: str, model: str, cost: float = 0.0, tokens: int = 0,
+                     tokens_in: int = 0, tokens_out: int = 0, client_ip: str = '',
+                     ancestor_keys=None, api_key_id=None, ancestor_ids=None):
+        """Stable request-time IDs take precedence over mutable credentials."""
+        counters = [counter for _, counter in self._chain_counters(
+            api_key, ancestor_keys, api_key_id=api_key_id, ancestor_ids=ancestor_ids)]
+        counters.extend(counter for counter in (self._global, self._global_dimensional)
+                        if counter is not None)
+        for counter in counters:
+            counter.record_usage(model, cost, tokens, tokens_in=tokens_in,
+                                 tokens_out=tokens_out, client_ip=client_ip)
+        self._check_and_save()
+
+    def get_key_status(self, api_key: str, model: str = 'default') -> dict:
+        counter = self._counters.get(api_key)
+        result = counter.get_status(model) if counter else {}
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            result.update(dimensional_counter.get_status())
+        return result
+
+    def get_ip_quota_breakdown(self, api_key: str, client_ip: str) -> List[dict]:
+        output = []
+        legacy_counter = self._counters.get(api_key)
+        if legacy_counter:
+            output.extend(legacy_counter.get_ip_breakdown(client_ip))
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            output.extend(dimensional_counter.get_ip_breakdown(client_ip))
+        return output
+
+    def get_ip_quota_summary(self, api_key: str, client_ip: str) -> Optional[dict]:
+        breakdown = self.get_ip_quota_breakdown(api_key, client_ip)
+        limits = [limit for rule in breakdown for bucket in rule.get('buckets', []) for limit in bucket.get('limits', [])]
+        if not limits:
+            if breakdown:
+                return {
+                    'remaining_ratio': 1.0,
+                    'exhausted': False,
+                    'rule_count': len(breakdown),
+                    'bucket_count': 0,
+                    'label': '',
+                    'measure': '',
+                    'current': 0,
+                    'limit': 0,
+                    'remaining': 0,
+                }
+            return None
+        worst = min(limits, key=lambda item: item.get('remaining_ratio', 1.0))
+        return {
+            'remaining_ratio': worst.get('remaining_ratio', 1.0),
+            'exhausted': any(item.get('remaining', 0) <= 0 for item in limits),
+            'rule_count': len([rule for rule in breakdown if rule.get('buckets')]),
+            'bucket_count': sum(len(rule.get('buckets', [])) for rule in breakdown),
+            'label': worst.get('label', ''),
+            'measure': worst.get('measure', ''),
+            'current': worst.get('current', 0),
+            'limit': worst.get('limit', 0),
+            'remaining': worst.get('remaining', 0),
+        }
+
+    def reset_key_status(self, api_key: str, status_key: str) -> dict:
+        if status_key.startswith('rule:'):
+            dimensional_counter = self._dimensional_counters.get(api_key)
+            if not dimensional_counter:
+                raise KeyError(api_key)
+            result = dimensional_counter.reset_rule(status_key.split(':', 1)[1])
+        else:
+            counter = self._counters.get(api_key)
+            if not counter:
+                raise KeyError(api_key)
+            result = counter.reset_status(status_key)
+        result['api_key'] = api_key
+        self._save_snapshot()
+        return result
+
+    def has_quota(self, api_key: str) -> bool:
+        return bool(self._global or self._global_dimensional) or any(self._chain_counters(api_key))
+
+    # ── 快照持久化 ──
+
+    def _capture_snapshot(self) -> dict:
+        data: dict = {'v': 1, 't': time(), 'c': {}, 'd': {}, 'ids': dict(self._key_ids)}
+        for api_key, counter in self._counters.items():
+            snap = counter._snapshot()
+            if snap.get('fixed') or snap.get('ip_fixed') or snap.get('permanent'):
+                data['c'][api_key] = snap
+        if self._global:
+            snap = self._global._snapshot()
+            if snap.get('fixed') or snap.get('ip_fixed') or snap.get('permanent'):
+                data['g'] = snap
+        for api_key, counter in self._dimensional_counters.items():
+            snap = counter.snapshot()
+            if snap.get('buckets'):
+                data['d'][api_key] = snap
+        if self._global_dimensional:
+            snap = self._global_dimensional.snapshot()
+            if snap.get('buckets'):
+                data['gd'] = snap
+        return data
+
+    def _apply_snapshot(self, data: dict):
+        if not data or data.get('v') != 1:
+            return
+        total = 0
+        for api_key, snap in data.get('c', {}).items():
+            counter = self._counters.get(api_key)
+            if counter:
+                total += counter._restore_snapshot(snap)
+        if self._global and data.get('g'):
+            total += self._global._restore_snapshot(data['g'])
+        for api_key, snap in data.get('d', {}).items():
+            counter = self._dimensional_counters.get(api_key)
+            if counter:
+                total += counter.restore_snapshot(snap)
+        if self._global_dimensional and data.get('gd'):
+            total += self._global_dimensional.restore_snapshot(data['gd'])
+        if total > 0:
+            logger.info(f"Restored {total} fixed quota windows from snapshot")
+
+    def _save_snapshot(self):
+        data = self._capture_snapshot()
+        try:
+            os.makedirs(os.path.dirname(_SNAPSHOT_PATH), exist_ok=True)
+            tmp = _SNAPSHOT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, separators=(',', ':'))
+            os.replace(tmp, _SNAPSHOT_PATH)
+        except Exception as e:
+            logger.warning(f"Failed to save quota snapshot: {e}")
+
+    def _read_snapshot_file(self) -> dict:
+        try:
+            with open(_SNAPSHOT_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _check_and_save(self):
+        dirty = False
+        for counter in self._counters.values():
+            if counter._snapshot_dirty:
+                counter._snapshot_dirty = False
+                dirty = True
+        if self._global and self._global._snapshot_dirty:
+            self._global._snapshot_dirty = False
+            dirty = True
+        for counter in self._dimensional_counters.values():
+            if counter._snapshot_dirty:
+                counter._snapshot_dirty = False
+                dirty = True
+        if self._global_dimensional and self._global_dimensional._snapshot_dirty:
+            self._global_dimensional._snapshot_dirty = False
+            dirty = True
+        if dirty:
+            self._save_snapshot()
+
+
+# ──────────────────────────────────────────────
+# 工具函数
+# ──────────────────────────────────────────────
+
+def _parse_status_key(status_key: str) -> Tuple[Scope, Metric, str]:
+    raw = str(status_key or '').strip()
+    parts = raw.split(':', 2)
+    if len(parts) != 3:
+        raise ValueError(f"Invalid quota status key: {status_key!r}")
+    scope_raw, metric_raw, qualifier = parts
+    try:
+        scope = Scope(scope_raw)
+        metric = Metric(metric_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid quota status key: {status_key!r}") from exc
+    if not qualifier:
+        qualifier = 'default'
+    return scope, metric, qualifier
+
+
+def _model_match(qualifier: str, model: str) -> bool:
+    """模型匹配：精确 → 包含 → default 通配。"""
+
+    if qualifier == 'default':
+        return True
+    if qualifier == model:
+        return True
+    return qualifier in model
+
+
+def _key_metric_qualifier_matches(qualifier: str, model: str) -> bool:
+    """判断 key scope token 类 qualifier 是否匹配本次模型。"""
+
+    # 修改原因：旧 token:claude 代表模型限定 token 规则，而新 cost:daily 代表标签规则。
+    # 修改方式：常见时间标签和 default 视为全模型规则，其它 token qualifier 继续按模型名匹配。
+    # 目的：兼容旧 token 模型规则，同时支持新正交状态 key 的 qualifier 标签。
+    if qualifier in _LABEL_QUALIFIERS:
+        return True
+    return _model_match(qualifier, model)
+
+
+def _period_str(period: float) -> str:
+    if math.isinf(period):
+        return 'inf'
+    if period >= 86400:
+        days = period / 86400
+        return f"{int(days)}d" if days == int(days) else f"{days}d"
+    if period >= 3600:
+        hours = period / 3600
+        return f"{int(hours)}h" if hours == int(hours) else f"{hours}h"
+    if period >= 60:
+        minutes = period / 60
+        return f"{int(minutes)}min" if minutes == int(minutes) else f"{minutes}min"
+    return f"{int(period)}s"
+
+
+def _status(current: float, limit: Limit, reset_at: Optional[float] = None, now: Optional[float] = None) -> dict:
+    display_current = current if isinstance(current, int) else round(current, 4)
+    remaining = max(0, limit.value - current)
+    data = {
+        'current': display_current,
+        'limit': limit.value,
+        'period': limit.period if not math.isinf(limit.period) else 'inf',
+        'window': limit.window.value,
+        'remaining': remaining if isinstance(remaining, int) else round(remaining, 4),
+        'label': f"{_format_limit_value(limit.value)}/{_period_str(limit.period)}",
+    }
+    if reset_at is not None:
+        base_now = time() if now is None else now
+        if reset_at > base_now:
+            data['reset_at'] = round(reset_at, 3)
+            data['reset_in'] = round(reset_at - base_now, 3)
+    return data
+
+
+def _format_limit_value(value: float) -> str:
+    if value == int(value):
+        return str(int(value))
+    return str(value)
+
+
+def _limit_message(rule: Rule, current: float, limit: Limit) -> str:
+    if rule.metric == Metric.REQUEST:
+        if rule.scope == Scope.IP:
+            return f"IP rate limited ({int(limit.value)}/{_period_str(limit.period)})"
+        return f"Request rate limited ({int(limit.value)}/{_period_str(limit.period)})"
+    if rule.metric == Metric.COST:
+        return f"Cost quota exceeded (${current:.2f}/${limit.value:.2f})"
+    if rule.metric == Metric.TOKEN:
+        return f"Token quota exceeded ({int(current)}/{int(limit.value)})"
+    if rule.metric == Metric.TOKEN_IN:
+        return f"Token input quota exceeded ({int(current)}/{int(limit.value)})"
+    if rule.metric == Metric.TOKEN_OUT:
+        return f"Token output quota exceeded ({int(current)}/{int(limit.value)})"
+    return f"Quota exceeded ({int(current)}/{int(limit.value)})"

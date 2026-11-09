@@ -1,0 +1,1693 @@
+"""
+Gemini 渠道适配器
+
+负责处理 Google Gemini API 的请求构建和响应流解析
+"""
+
+import re
+import json
+import copy
+import asyncio
+from datetime import datetime
+from uuid import uuid4
+
+from ..models import Message
+from ..utils import (
+    safe_get,
+    get_model_dict,
+    get_base64_image,
+    generate_sse_response,
+    generate_no_stream_response,
+    end_of_line,
+    generate_chunked_image_md,
+)
+from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text, json_dumps_bytes
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..stream_errors import extract_stream_error
+from ..usage import extract_cache_usage
+from ..file_utils import extract_base64_data
+from urllib.parse import urlparse
+
+
+# ============================================================
+# Gemini 工具函数
+# ============================================================
+
+def _is_image_model(model_name: str) -> bool:
+    """判断模型是否为图片生成模型（基于模型名约定）"""
+    name = model_name.lower()
+    return "-image" in name or "image-generation" in name
+
+
+# ============================================================
+# Gemini 格式化函数
+# ============================================================
+
+def format_text_message(text: str) -> dict:
+    """格式化文本消息为 Gemini 格式"""
+    return {"text": text}
+
+
+async def format_image_message(image_url: str) -> dict:
+    """格式化图片消息为 Gemini 格式"""
+    base64_image, image_type = await get_base64_image(image_url)
+    return {
+        "inlineData": {
+            "mimeType": image_type,
+            "data": extract_base64_data(base64_image),
+        }
+    }
+
+gemini_max_token_65k_models = [
+    "gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash",
+    "gemini-3", "gemini-4",
+]
+
+_GEMINI_CORE_HARM_CATEGORIES = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+    "HARM_CATEGORY_JAILBREAK",
+)
+_VERTEX_EXTRA_HARM_CATEGORIES = (
+    "HARM_CATEGORY_IMAGE_HATE",
+    "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_IMAGE_HARASSMENT",
+    "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT",
+)
+
+
+def _is_vertex_provider(engine: str | None, provider: dict | None) -> bool:
+    eng = str(engine or (provider or {}).get("engine") or "").strip().lower()
+    if eng in ("firebasevertex", "vertex-gemini", "vertex-express", "vertex") or eng.startswith("firebasevertex") or eng.startswith("vertex"):
+        return True
+    base_url = str((provider or {}).get("base_url") or "").strip().lower()
+    if "vertex" in base_url or "aiplatform.googleapis.com" in base_url:
+        return True
+    return False
+
+
+def build_gemini_safety_settings(threshold: str, *, is_vertex: bool = False) -> list[dict]:
+    cats = list(_GEMINI_CORE_HARM_CATEGORIES)
+    if is_vertex:
+        cats.extend(_VERTEX_EXTRA_HARM_CATEGORIES)
+    return [{"category": c, "threshold": threshold} for c in cats]
+
+
+_GEMINI_UNSUPPORTED_SCHEMA_FIELDS = (
+    "additionalProperties",
+    "additionalItems",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "$schema",
+    "$id",
+    "$comment",
+    "$anchor",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "$vocabulary",
+    "$defs",
+    "definitions",
+    "defs",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "not",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minimum",
+    "maximum",
+    "multipleOf",
+    "patternProperties",
+    "propertyNames",
+    "minProperties",
+    "maxProperties",
+    "contains",
+    "minContains",
+    "maxContains",
+    "if",
+    "then",
+    "else",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "examples",
+    "strict",
+)
+
+
+def inline_schema_refs(parameters, extra_defs=None):
+    """展开 JSON Schema 中的 $ref/$defs/definitions，消除 Gemini Protobuf 不支持的 $ref 字段。"""
+    if not isinstance(parameters, dict):
+        return
+    defs = {}
+    for defs_key in ("$defs", "definitions", "defs"):
+        extracted = parameters.pop(defs_key, None)
+        if isinstance(extracted, dict):
+            defs.update(extracted)
+    if isinstance(extra_defs, dict):
+        for k, v in extra_defs.items():
+            defs.setdefault(k, v)
+
+    def _resolve(node, depth):
+        if isinstance(node, dict):
+            for defs_key in ("$defs", "definitions", "defs"):
+                nested_defs = node.pop(defs_key, None)
+                if isinstance(nested_defs, dict):
+                    for k, v in nested_defs.items():
+                        defs.setdefault(k, v)
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/"):
+                name = ref.rsplit("/", 1)[-1]
+                if depth >= 2 or name not in defs:
+                    node.pop("$ref", None)
+                    node.setdefault("type", "object")
+                    desc = node.get("description", "")
+                    node["description"] = f"{desc}\nSchema ref: {name}".strip()
+                else:
+                    merged = copy.deepcopy(defs[name])
+                    for k, v in node.items():
+                        if k != "$ref":
+                            merged[k] = v
+                    node.clear()
+                    node.update(merged)
+                    _resolve(node, depth + 1)
+                    return
+            for value in list(node.values()):
+                _resolve(value, depth)
+        elif isinstance(node, list):
+            for item in node:
+                _resolve(item, depth)
+
+    _resolve(parameters, 0)
+
+
+# 多类型联合拆成 anyOf 分支时，只属于某一类型的约束字段要跟随对应分支。
+_TYPE_SPECIFIC_SCHEMA_FIELDS = {
+    "array": ("items", "prefixItems", "minItems", "maxItems"),
+    "object": ("properties", "required", "minProperties", "maxProperties"),
+    "string": ("enum", "format"),
+    "number": ("minimum", "maximum"),
+    "integer": ("minimum", "maximum"),
+}
+
+
+def _is_typed_schema_branch(item) -> bool:
+    """判断 anyOf/oneOf 分支是否自带类型定义（而不是只有 required 一类的约束）。"""
+    if not isinstance(item, dict):
+        return False
+    return (
+        (item.get("type") is not None and item.get("type") != "null")
+        or any(k in item for k in ("properties", "items", "enum", "anyOf", "oneOf", "allOf"))
+    )
+
+
+def process_tool_parameters(data):
+    """递归清洗 JSON Schema 使其兼容 Google Gemini / Vertex AI OpenAPI 3.0 Protobuf Schema。"""
+    if not isinstance(data, dict):
+        return
+
+    # 0. 处理逻辑组合符 (anyOf / oneOf / allOf)
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in data:
+            logic_list = data.pop(key)
+            if isinstance(logic_list, list) and logic_list:
+                if any(
+                    isinstance(item, dict) and (item.get("type") == "null" or ("const" in item and item.get("const") is None))
+                    for item in logic_list
+                ):
+                    data["nullable"] = True
+                non_null_items = [
+                    item for item in logic_list
+                    if isinstance(item, dict) and item.get("type") != "null" and not ("const" in item and item.get("const") is None)
+                ]
+                # Case A: 所有非 null 分支均为 const / enum 字面量枚举（如 Zod/TypeBox 联合字面量）
+                if non_null_items and all(
+                    ("const" in item or isinstance(item.get("enum"), list))
+                    and "properties" not in item
+                    and "items" not in item
+                    for item in non_null_items
+                ):
+                    merged_enum = []
+                    for item in non_null_items:
+                        if "const" in item and item.get("const") is not None:
+                            s_val = str(item["const"])
+                            if s_val not in merged_enum:
+                                merged_enum.append(s_val)
+                        if isinstance(item.get("enum"), list):
+                            for val in item["enum"]:
+                                if val is None:
+                                    data["nullable"] = True
+                                else:
+                                    s_val = str(val)
+                                    if s_val not in merged_enum:
+                                        merged_enum.append(s_val)
+                    if merged_enum:
+                        data["enum"] = merged_enum
+                        data["type"] = "string"
+                # Case B: allOf 多对象属性合并
+                elif key == "allOf" and len(non_null_items) > 1 and any("properties" in item for item in non_null_items):
+                    merged_props = dict(data.get("properties") or {})
+                    merged_req = list(data.get("required") or [])
+                    for item in non_null_items:
+                        item_copy = copy.deepcopy(item)
+                        process_tool_parameters(item_copy)
+                        if isinstance(item_copy.get("properties"), dict):
+                            merged_props.update(item_copy["properties"])
+                        if isinstance(item_copy.get("required"), list):
+                            for r_key in item_copy["required"]:
+                                if r_key not in merged_req:
+                                    merged_req.append(r_key)
+                        for k, v in item_copy.items():
+                            if k not in ("properties", "required") and k not in data:
+                                data[k] = v
+                    if merged_props:
+                        data["properties"] = merged_props
+                        data.setdefault("type", "object")
+                    if merged_req:
+                        data["required"] = merged_req
+                # Case C: 多个自带类型的 anyOf / oneOf 分支，保留为 Gemini Schema 原生支持的 anyOf，
+                #   避免只取第一个分支导致参数类型被改变（如 string | number 变成 string）。
+                elif (
+                    key in ("anyOf", "oneOf")
+                    and len(non_null_items) > 1
+                    and not any(k in data for k in ("type", "properties", "items"))
+                    and all(_is_typed_schema_branch(item) for item in non_null_items)
+                ):
+                    branches = []
+                    for item in non_null_items:
+                        branch = copy.deepcopy(item)
+                        process_tool_parameters(branch)
+                        branches.append(branch)
+                    data["anyOf"] = branches
+                # Case D: 其他情况，取第一个有实质定义的非 null 分支递归清洗后合并
+                elif non_null_items:
+                    main_item = next(
+                        (
+                            item for item in non_null_items
+                            if (item.get("type") and item.get("type") != "null")
+                            or "properties" in item
+                            or "items" in item
+                            or "const" in item
+                            or "enum" in item
+                        ),
+                        non_null_items[0],
+                    )
+                    main_copy = copy.deepcopy(main_item)
+                    process_tool_parameters(main_copy)
+                    for k, v in main_copy.items():
+                        if k not in data:
+                            data[k] = v
+
+    # 0.5 处理单字段 const -> enum 以及联合类型数组 type: ["string", "null"]
+    if "const" in data:
+        const_val = data.pop("const")
+        if const_val is None:
+            data["nullable"] = True
+        else:
+            data["enum"] = [str(const_val)]
+            data["type"] = "string"
+
+    raw_type = data.get("type")
+    if isinstance(raw_type, list):
+        if "null" in raw_type or None in raw_type:
+            data["nullable"] = True
+        non_null_types = list(dict.fromkeys(t for t in raw_type if isinstance(t, str) and t != "null"))
+        if len(non_null_types) > 1:
+            # 真正的多类型联合：Gemini Schema 的 type 只能是标量，改写为 anyOf，每个类型一个分支。
+            data.pop("type")
+            branches = []
+            for type_name in non_null_types:
+                branch = {"type": type_name}
+                for field in _TYPE_SPECIFIC_SCHEMA_FIELDS.get(type_name, ()):
+                    if field in data:
+                        branch[field] = copy.deepcopy(data[field])
+                process_tool_parameters(branch)
+                branches.append(branch)
+            for type_name in non_null_types:
+                for field in _TYPE_SPECIFIC_SCHEMA_FIELDS.get(type_name, ()):
+                    data.pop(field, None)
+            data["anyOf"] = branches
+        else:
+            data["type"] = non_null_types[0] if non_null_types else "string"
+
+    if isinstance(data.get("enum"), list):
+        raw_enum = data["enum"]
+        if None in raw_enum:
+            data["nullable"] = True
+        clean_enum = [str(v) for v in raw_enum if v is not None]
+        if clean_enum:
+            data["enum"] = clean_enum
+            if "anyOf" not in data:
+                data["type"] = "string"
+        else:
+            data.pop("enum", None)
+
+    # 0.8 处理 prefixItems 与非 dict 的 items（元组数组或缺失 items 的 array）
+    if "prefixItems" in data:
+        prefix_items = data.pop("prefixItems")
+        if "items" not in data or isinstance(data.get("items"), bool):
+            if isinstance(prefix_items, list) and prefix_items and isinstance(prefix_items[0], dict):
+                data["items"] = copy.deepcopy(prefix_items[0])
+            else:
+                data["items"] = {"type": "string"}
+
+    # 1. 移除 Gemini 不支持的字段
+    for field in _GEMINI_UNSUPPORTED_SCHEMA_FIELDS:
+        data.pop(field, None)
+
+    # 2. 确保 required 中的属性在 properties 中确实存在
+    properties = data.get("properties")
+    required = data.get("required")
+    if isinstance(required, list):
+        if isinstance(properties, dict):
+            data["required"] = [field for field in required if field in properties]
+            if not data["required"]:
+                data.pop("required", None)
+        else:
+            data.pop("required", None)
+
+    # 3. 将 'default' 值移入 'description'
+    if "default" in data:
+        default_value = data.pop("default")
+        description = data.get("description", "")
+        data["description"] = f"{description}\nDefault: {default_value}".strip()
+
+    # 4. 补齐缺失的 type 并递归处理嵌套 properties 与 items
+    if isinstance(properties, dict):
+        data.setdefault("type", "object")
+        for val in properties.values():
+            process_tool_parameters(val)
+
+    items = data.get("items")
+    if isinstance(items, list):
+        data["items"] = copy.deepcopy(items[0]) if (items and isinstance(items[0], dict)) else {"type": "string"}
+        items = data["items"]
+    elif isinstance(items, bool):
+        data["items"] = {"type": "string"}
+        items = data["items"]
+
+    if data.get("type") == "array" and not isinstance(items, dict):
+        data["items"] = {"type": "string"}
+        items = data["items"]
+
+    if isinstance(items, dict):
+        data.setdefault("type", "array")
+        process_tool_parameters(items)
+
+
+def _extract_tool_result_text(content) -> str:
+    """将 OpenAI tool 消息的 content (str | list[ContentItem] | None) 归一化为纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("text"):
+                    parts.append(str(item["text"]))
+            elif hasattr(item, "text") and item.text:
+                parts.append(str(item.text))
+        return "\n".join(parts)
+    return str(content)
+
+
+def apply_gemini_response_format(request, generation_config: dict) -> None:
+    """将 OpenAI response_format (json_object / json_schema) 转换为 Gemini generationConfig 字段。"""
+    resp_fmt = getattr(request, "response_format", None)
+    if not resp_fmt:
+        return
+    fmt_type = resp_fmt.get("type") if isinstance(resp_fmt, dict) else getattr(resp_fmt, "type", None)
+    if fmt_type == "json_object":
+        generation_config["responseMimeType"] = "application/json"
+    elif fmt_type == "json_schema":
+        generation_config["responseMimeType"] = "application/json"
+        js_obj = resp_fmt.get("json_schema") if isinstance(resp_fmt, dict) else getattr(resp_fmt, "json_schema", None)
+        raw_schema = None
+        if isinstance(js_obj, dict):
+            raw_schema = js_obj.get("schema")
+        elif js_obj is not None:
+            raw_schema = getattr(js_obj, "schema", None)
+        if isinstance(raw_schema, dict) and raw_schema:
+            schema_copy = copy.deepcopy(raw_schema)
+            inline_schema_refs(schema_copy)
+            process_tool_parameters(schema_copy)
+            generation_config["responseSchema"] = schema_copy
+
+
+def normalize_gemini_payload(payload: dict) -> dict:
+    """规范化 Gemini 负载，合并驼峰和下划线字段，处理拼写错误"""
+    # 1. 定义映射关系 (别名 -> 标准键)
+    # Gemini AI Studio 标准使用 camelCase 顶层键
+    mapping = {
+        "generation_config": "generationConfig",
+        "generate_config": "generationConfig",
+        "safety_settings": "safetySettings",
+        "safety": "safetySettings",
+        "safty": "safetySettings",
+        "system_instruction": "systemInstruction",
+        "tool_config": "toolConfig", # 虽然 REST 有时用下划线，但规范化为 camelCase 后下面会处理
+    }
+
+    # 2. 合并字典中的字段
+    for alias, canonical in mapping.items():
+        if alias in payload:
+            value = payload.pop(alias)
+            if canonical not in payload:
+                payload[canonical] = value
+            elif isinstance(value, dict) and isinstance(payload[canonical], dict):
+                # 深度合并字典 (如 generationConfig)
+                payload[canonical].update(value)
+            # 如果是列表等其他类型，以标准键为准，不覆盖
+
+    # 3. 特殊处理 tool_config: Gemini AI Studio 实际倾向于使用 tool_config (snake_case)
+    # 保持与原有代码一致性
+    if "toolConfig" in payload:
+        payload["tool_config"] = payload.pop("toolConfig")
+
+    return payload
+
+
+async def patch_passthrough_gemini_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对 Gemini native payload 做渠道级修饰（system_prompt 注入 + trailing model 兜底 + AIS/Vertex safetySettings 对齐）。"""
+    if isinstance(payload, dict):
+        is_vertex = _is_vertex_provider(engine, provider)
+        contents = payload.get("contents")
+        if isinstance(contents, list):
+            if not is_vertex:
+                # AIS 渠道 (generativelanguage.googleapis.com) 的 contents 仅允许 role 为 user/model，
+                # 严禁出现 role="system"（如客户端针对 Vertex 追加的尾部空 system 块）。
+                cleaned_contents = []
+                for _m in contents:
+                    if isinstance(_m, dict) and _m.get("role") == "system":
+                        _pts = _m.get("parts") if isinstance(_m.get("parts"), list) else []
+                        _non_empty = any(
+                            isinstance(p, dict) and (str(p.get("text") or "").strip() or any(k != "text" for k in p))
+                            for p in _pts
+                        )
+                        if _non_empty:
+                            _m_copy = dict(_m)
+                            _m_copy["role"] = "user"
+                            cleaned_contents.append(_m_copy)
+                        continue
+                    cleaned_contents.append(_m)
+                contents = cleaned_contents
+                payload["contents"] = contents
+
+            for _msg in contents:
+                if not isinstance(_msg, dict) or _msg.get("role") != "model":
+                    continue
+                _parts = _msg.get("parts")
+                if not isinstance(_parts, list):
+                    continue
+                _fc_parts = [p for p in _parts if isinstance(p, dict) and ("functionCall" in p or "function_call" in p)]
+                if _fc_parts and not any(p.get("thoughtSignature") or p.get("thought_signature") for p in _fc_parts):
+                    _turn_sig = next(
+                        (p.get("thoughtSignature") or p.get("thought_signature") for p in _parts if isinstance(p, dict) and (p.get("thoughtSignature") or p.get("thought_signature"))),
+                        None,
+                    )
+                    _fc_parts[0]["thoughtSignature"] = _turn_sig or "skip_thought_signature_validator"
+            if not contents or (isinstance(contents[-1], dict) and contents[-1].get("role") == "model"):
+                contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+        s_key = "safetySettings" if "safetySettings" in payload else ("safety_settings" if "safety_settings" in payload else None)
+        if s_key and isinstance(payload.get(s_key), list):
+            items = [x for x in payload[s_key] if isinstance(x, dict)]
+            if not is_vertex:
+                # AIS 渠道过滤掉 Vertex 专属的 HARM_CATEGORY_IMAGE_* 避免 400
+                payload[s_key] = [
+                    x for x in items
+                    if x.get("category") not in _VERTEX_EXTRA_HARM_CATEGORIES
+                ]
+            else:
+                # Vertex 渠道自动补齐缺失的 4 个 IMAGE_* 分类
+                existing = {x.get("category") for x in items}
+                default_thresh = next((x.get("threshold") for x in items if x.get("threshold")), "OFF")
+                for c in _VERTEX_EXTRA_HARM_CATEGORIES:
+                    if c not in existing:
+                        items.append({"category": c, "threshold": default_thresh})
+                payload[s_key] = items
+
+        raw_tools = payload.get("tools")
+        if isinstance(raw_tools, list):
+            for _t_group in raw_tools:
+                if not isinstance(_t_group, dict):
+                    continue
+                _decls = _t_group.get("functionDeclarations") or _t_group.get("function_declarations")
+                if isinstance(_decls, list):
+                    for _decl in _decls:
+                        if isinstance(_decl, dict) and isinstance(_decl.get("parameters"), dict):
+                            inline_schema_refs(_decl["parameters"])
+                            process_tool_parameters(_decl["parameters"])
+
+    system_prompt = (modifications or {}).get("system_prompt") if isinstance(modifications, dict) else None
+    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
+    if not system_prompt_text:
+        return payload
+
+    # 兼容 systemInstruction / system_instruction
+    key = "systemInstruction" if "systemInstruction" in payload else ("system_instruction" if "system_instruction" in payload else "systemInstruction")
+    sys_inst = payload.get(key)
+
+    if isinstance(sys_inst, dict):
+        parts = sys_inst.get("parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+            old = parts[0].get("text") or ""
+            parts[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
+        else:
+            sys_inst["parts"] = [{"text": system_prompt_text}]
+        payload[key] = sys_inst
+    else:
+        payload[key] = {"parts": [{"text": system_prompt_text}]}
+
+    return payload
+
+
+async def get_gemini_payload(request, engine, provider, api_key=None):
+    """构建 Gemini API 的请求 payload"""
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    
+    # 使用 x-goog-api-key 头部认证，避免 URL 参数中的特殊字符问题
+    if api_key:
+        headers['x-goog-api-key'] = api_key
+
+    # 获取映射后的实际模型ID
+    model_dict = get_model_dict(provider)
+    original_model = model_dict[request.model]
+
+    if request.stream:
+        gemini_stream = "streamGenerateContent"
+        # 流式请求需要 alt=sse 参数才能返回 SSE 格式
+        sse_param = "?alt=sse"
+    else:
+        gemini_stream = "generateContent"
+        sse_param = ""
+    url = provider['base_url']
+    parsed_url = urlparse(url)
+
+    # 如果 base_url 以 '#' 结尾，直接使用去掉 '#' 后的地址，跳过路径拼接
+    if provider['base_url'].endswith('#'):
+        url = provider['base_url'][:-1].rstrip('/')
+    else:
+        # 正常路径拼接
+        url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.split('/models')[0].rstrip('/')}/models/{original_model}:{gemini_stream}{sse_param}"
+
+    if "/v1beta" in parsed_url.path:
+        api_version = "v1beta"
+    else:
+        api_version = "v1"
+
+    messages = []
+    systemInstruction = None
+    system_prompt = ""
+    function_arguments = None
+    # 修改原因：OpenAI tool 消息的 tool_call_id 是调用 ID 而非函数名，直接当 functionResponse.name 发送会与 functionCall 名称不匹配。
+    # 修改方式：在转换 functionCall 时记录 tool_call_id → 函数名映射，生成 functionResponse 时优先查映射。
+    # 目的：让 functionResponse 名称始终与本轮 functionCall 一致，避免上游因名称不匹配拒绝请求。
+    tool_call_name_map = {}
+    pending_fc_names = []
+    seen_non_system = False
+
+    try:
+        request_messages = [Message(role="user", content=request.prompt)]
+    except Exception:
+        request_messages = copy.deepcopy(request.messages)
+    for msg in request_messages:
+        if msg.role == "assistant":
+            msg.role = "model"
+        elif msg.role in ("system", "developer"):
+            if seen_non_system:
+                msg.role = "user"
+            else:
+                msg.role = "system"
+        if msg.role != "system":
+            seen_non_system = True
+        
+        parts = []
+        # 提取该消息可能携带的签名（兼容 thoughtSignature / thought_signature / signature）
+        msg_signature = (
+            getattr(msg, "thoughtSignature", None)
+            or getattr(msg, "thought_signature", None)
+            or getattr(msg, "signature", None)
+        )
+
+        # 1. 处理思维链
+        reasoning = getattr(msg, "reasoning_content", None)
+        if reasoning:
+            parts.append({"thought": True, "text": reasoning})
+
+        # 2. 处理内容 (文本/图片)
+        if isinstance(msg.content, list):
+            for item in msg.content:
+                if item.type == "text":
+                    parts.append(format_text_message(item.text))
+                elif item.type == "image_url" and provider.get("image", True):
+                    parts.append(await format_image_message(item.image_url.url))
+                elif item.type == "file":
+                    if getattr(item.file, "file_uri", None):
+                        parts.append({
+                            "fileData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "fileUri": item.file.file_uri
+                            }
+                        })
+                    elif getattr(item.file, "url", None):
+                        from ..file_utils import get_base64_file, parse_data_uri
+                        data_uri, mime_type = await get_base64_file(item.file.url)
+                        if data_uri.startswith("data:"):
+                            _, b64_data = parse_data_uri(data_uri)
+                        else:
+                            b64_data = data_uri
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": b64_data
+                            }
+                        })
+                    elif getattr(item.file, "data", None):
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": item.file.mime_type or "application/octet-stream",
+                                "data": item.file.data
+                            }
+                        })
+        elif msg.content:
+            parts.append({"text": msg.content})
+
+        # 3. 处理工具调用 (Model 角色下)
+        if msg.role == "model" and msg.tool_calls:
+            for i, tc in enumerate(msg.tool_calls):
+                # 转换 arguments
+                try:
+                    args = json_loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                except:
+                    args = {}
+
+
+                
+                part = {
+                    "functionCall": {
+                        "name": tc.function.name,
+                        "args": args
+                    }
+                }
+                if getattr(tc, "id", None):
+                    tool_call_name_map[tc.id] = tc.function.name
+                pending_fc_names.append(tc.function.name)
+                # 签名逻辑：第一个 FC 必须携带签名（兼容 thoughtSignature / thought_signature / signature）
+                _ec_google = (getattr(tc, "extra_content", {}) or {}).get("google", {}) or {}
+                sig = (
+                    _ec_google.get("thoughtSignature")
+                    or _ec_google.get("thought_signature")
+                    or _ec_google.get("signature")
+                    or getattr(tc, "thoughtSignature", None)
+                    or getattr(tc, "thought_signature", None)
+                )
+                if not sig and i == 0:
+                    sig = msg_signature or "skip_thought_signature_validator"
+                
+                if sig:
+                    part["thoughtSignature"] = sig
+                    msg_signature = None # 已消耗
+                
+                parts.append(part)
+
+        # 4. 如果没有工具调用但有签名，附在最后一个文本块
+        if msg_signature and parts:
+            # 找到最后一个非 thought 的文本块或 FC 块
+            parts[-1]["thoughtSignature"] = msg_signature
+
+        # 5. 处理函数响应 (Tool 角色下)
+        if msg.role == "tool":
+            fc_name = None
+            if msg.tool_call_id:
+                fc_name = tool_call_name_map.get(msg.tool_call_id)
+            if not fc_name:
+                if msg.name:
+                    fc_name = msg.name
+                elif pending_fc_names:
+                    fc_name = pending_fc_names.pop(0)
+                else:
+                    fc_name = msg.tool_call_id or "unknown_function"
+            # Google AI Studio API 要求函数响应的角色为 "user"
+            # 它将函数执行结果视为由用户/环境提供的上下文
+            # 修改原因：OpenAI 格式里每个 tool 响应是独立消息，但 Gemini 要求同一 function call turn 的全部响应合并在一个 user turn 的 parts 里。
+            # 修改方式：上一条输出已是 functionResponse 的 user 回合时直接追加 part，否则才新开回合。
+            # 目的：并行工具调用产生的多个响应共享同一 turn，满足上游 response/call parts 数量一致的校验。
+            fr_part = {
+                "functionResponse": {
+                    "name": fc_name,
+                    "response": {"result": _extract_tool_result_text(msg.content)}
+                }
+            }
+            if messages and messages[-1].get("role") == "user" and any("functionResponse" in p for p in messages[-1].get("parts", [])):
+                messages[-1]["parts"].append(fr_part)
+            else:
+                messages.append({
+                    "role": "user",
+                    "parts": [fr_part]
+                })
+        elif msg.role != "system" and parts:
+            messages.append({"role": msg.role, "parts": parts})
+        elif msg.role == "system":
+            # 系统提示词处理逻辑保持不变（不再将连续下划线压缩为单下划线）
+            sys_text = "".join([p.get("text", "") for p in parts if "text" in p])
+            if sys_text:
+                system_prompt = f"{system_prompt}\n\n{sys_text}" if system_prompt else sys_text
+    if system_prompt.strip():
+        systemInstruction = {"parts": [{"text": system_prompt.strip()}]}
+
+    if messages and messages[-1].get("role") == "model":
+        messages.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+
+    if any(off_model in original_model for off_model in gemini_max_token_65k_models) or _is_image_model(original_model):
+        safety_settings = "OFF"
+    else:
+        safety_settings = "BLOCK_NONE"
+
+    is_vertex = _is_vertex_provider(engine, provider)
+    payload = {
+        "contents": messages or [{"role": "user", "parts": [{"text": "No messages"}]}],
+        "safetySettings": build_gemini_safety_settings(safety_settings, is_vertex=is_vertex),
+    }
+
+    if systemInstruction:
+        if api_version == "v1beta":
+            payload["systemInstruction"] = systemInstruction
+        if api_version == "v1":
+            first_message = safe_get(payload, "contents", 0, "parts", 0, "text", default=None)
+            system_instruction = safe_get(systemInstruction, "parts", 0, "text", default=None)
+            if first_message and system_instruction:
+                payload["contents"][0]["parts"][0]["text"] = system_instruction + "\n" + first_message
+
+    miss_fields = [
+        'model',
+        'messages',
+        'stream',
+        'tool_choice',
+        'presence_penalty',
+        'frequency_penalty',
+        'n',
+        'user',
+        'include_usage',
+        'logprobs',
+        'top_logprobs',
+        'response_format',
+        'stream_options',
+        'prompt',
+        'size',
+        'max_completion_tokens',  # 将在下面转换为 maxOutputTokens
+        'extra_body',  # OpenAI 扩展字段，在下面单独处理转换
+        'thinking',  # OpenAI/Claude 思考配置
+        'chat_template_kwargs',  # OpenAI 特有字段
+        'min_p',  # OpenAI 特有字段
+        'reasoning_effort',
+        'parallel_tool_calls',
+        'logit_bias',
+        'service_tier',
+        # OpenAI stop sequences (Gemini 原生接口不接受 stop 顶层字段)
+        'stop',
+    ]
+    generation_config = {}
+    apply_gemini_response_format(request, generation_config)
+
+    for field, value in request.model_dump(exclude_unset=True).items():
+        if field not in miss_fields and value is not None:
+            if field == "tools" and ("gemini-2.0-flash-thinking" in original_model or _is_image_model(original_model)):
+                continue
+            if field == "tools":
+                # 处理每个工具的 function 定义
+                processed_tools = []
+                original_tools = request.tools or []
+                for tool_idx, tool in enumerate(value):
+                    # 深度克隆以避免修改原始请求对象
+                    function_def = copy.deepcopy(tool["function"])
+                    # 移除 OpenAI 特有的 strict 字段
+                    function_def.pop("strict", None)
+                    
+                    if "parameters" in function_def:
+                        # model_dump 有意排除 defs 字段，从原始 pydantic 对象恢复 $defs 供 $ref 解引用
+                        extra_defs = None
+                        if tool_idx < len(original_tools):
+                            orig = original_tools[tool_idx]
+                            if isinstance(orig, dict):
+                                orig_params = (orig.get("function") or {}).get("parameters") or {}
+                                extra_defs = orig_params.get("$defs") or orig_params.get("defs")
+                            else:
+                                orig_params = getattr(getattr(orig, "function", None), "parameters", None)
+                                extra_defs = getattr(orig_params, "defs", None) if orig_params is not None else None
+                        inline_schema_refs(function_def["parameters"], extra_defs)
+                        process_tool_parameters(function_def["parameters"])
+
+                    if function_def["name"] not in ["googleSearch", "google_search"]:
+                        processed_tools.append({"function": function_def})
+
+                if processed_tools:
+                    tool_config = {"function_calling_config": {"mode": "AUTO"}}
+                    
+                    # 处理 tool_choice (OpenAI 风格 -> Gemini 风格)
+                    tc = request.tool_choice
+                    if tc:
+                        if tc == "required":
+                            tool_config["function_calling_config"]["mode"] = "ANY"
+                        elif tc == "none":
+                            tool_config["function_calling_config"]["mode"] = "NONE"
+                        elif isinstance(tc, dict) and tc.get("type") == "function":
+                            fn_name = tc.get("function", {}).get("name")
+                            if fn_name:
+                                tool_config["function_calling_config"]["mode"] = "ANY"
+                                tool_config["function_calling_config"]["allowed_function_names"] = [fn_name]
+                        elif hasattr(tc, "type") and tc.type == "function" and tc.function:
+                            fn_name = tc.function.name
+                            tool_config["function_calling_config"]["mode"] = "ANY"
+                            tool_config["function_calling_config"]["allowed_function_names"] = [fn_name]
+
+                    payload.update({
+                        "tools": [{
+                            "function_declarations": [tool["function"] for tool in processed_tools]
+                        }],
+                        "tool_config": tool_config
+                    })
+            elif field == "temperature":
+                if _is_image_model(original_model):
+                    value = 1
+                generation_config["temperature"] = value
+            elif field == "max_tokens" or field == "max_completion_tokens":
+                if value > 65536:
+                    value = 65536
+                generation_config["maxOutputTokens"] = value
+            elif field == "top_p":
+                generation_config["topP"] = value
+            else:
+                payload[field] = value
+
+    payload["generationConfig"] = generation_config
+
+    # OpenAI stop -> Gemini generationConfig.stopSequences
+    # 说明：部分第三方客户端（如 SillyTavern）会携带 stop 字段；
+    # Gemini 的 REST 接口不接受顶层 stop，但支持 generationConfig.stopSequences。
+    stop_value = getattr(request, "stop", None)
+    if stop_value:
+        if isinstance(stop_value, str):
+            payload["generationConfig"]["stopSequences"] = [stop_value]
+        elif isinstance(stop_value, list):
+            payload["generationConfig"]["stopSequences"] = [str(x) for x in stop_value if x is not None]
+
+    if "maxOutputTokens" not in generation_config:
+        payload["generationConfig"]["maxOutputTokens"] = 32768
+
+        if _is_image_model(original_model):
+            payload["generationConfig"]["responseModalities"] = [
+                "Text",
+                "Image",
+            ]
+
+    # 处理 OpenAI extra_body.google 配置，转换 snake_case 到 camelCase 后合并到 generationConfig
+    request_data = request.model_dump(exclude_unset=True)
+    extra_body = request_data.get('extra_body')
+    
+    if isinstance(extra_body, dict):
+        google_config = extra_body.get('google', {})
+        if isinstance(google_config, dict) and google_config:
+            def _snake_to_camel(s: str) -> str:
+                """将 snake_case 转换为 camelCase，但保留已经是 camelCase 的键"""
+                if any(c.isupper() for c in s) and '_' not in s:
+                    return s
+                parts = s.split('_')
+                return parts[0] + ''.join(word.capitalize() for word in parts[1:])
+            
+            def _convert_keys(obj):
+                """递归转换字典所有键从 snake_case 到 camelCase"""
+                if isinstance(obj, dict):
+                    return {_snake_to_camel(k): _convert_keys(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_convert_keys(item) for item in obj]
+                else:
+                    return obj
+            
+            def _deep_merge(target, source):
+                """深度合并两个字典"""
+                for key, value in source.items():
+                    if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                        _deep_merge(target[key], value)
+                    else:
+                        target[key] = value
+            
+            converted_config = _convert_keys(google_config)
+            # 合并到 generationConfig 中（extra_body.google.thinking_config -> generationConfig.thinkingConfig）
+            _deep_merge(payload["generationConfig"], converted_config)
+
+    if "gemini-2.5" in original_model and not _is_image_model(original_model):
+        # 从请求模型名中检测思考预算设置
+        m = re.match(r".*-think-(-?\d+)", request.model)
+        if m:
+            try:
+                val = int(m.group(1))
+                budget = None
+                # gemini-2.5-pro: [128, 32768]
+                if "gemini-2.5-pro" in original_model:
+                    if val < 128:
+                        budget = 128
+                    elif val > 32768:
+                        budget = 32768
+                    else: # 128 <= val <= 32768
+                        budget = val
+
+                # gemini-2.5-flash-lite: [0] or [512, 24576]
+                elif "gemini-2.5-flash-lite" in original_model:
+                    if val > 0 and val < 512:
+                        budget = 512
+                    elif val > 24576:
+                        budget = 24576
+                    else: # Includes 0 and valid range, and clamps invalid negatives
+                        budget = val if val >= 0 else 0
+
+                # gemini-2.5-flash (and other gemini-2.5 models as a fallback): [0, 24576]
+                else:
+                    if val > 24576:
+                        budget = 24576
+                    else: # Includes 0 and valid range, and clamps invalid negatives
+                        budget = val if val >= 0 else 0
+
+                payload["generationConfig"]["thinkingConfig"] = {
+                    "includeThoughts": True if budget else False,
+                    "thinkingBudget": budget
+                }
+            except ValueError:
+                # 如果转换为整数失败，忽略思考预算设置
+                pass
+        else:
+            payload["generationConfig"]["thinkingConfig"] = {
+                "includeThoughts": True,
+            }
+
+    return url, headers, normalize_gemini_payload(payload)
+
+
+def _extract_gemini_block_message(response_json: dict) -> str | None:
+    if not isinstance(response_json, dict):
+        return None
+    return (
+        safe_get(response_json, "promptFeedback", "blockReasonMessage", default=None)
+        or safe_get(response_json, "promptFeedback", "blockReason", default=None)
+        or safe_get(response_json, "candidates", 0, "blockReason", default=None)
+    )
+
+
+def _normalize_gemini_http_error(error_message: dict) -> dict:
+    """把 Gemini/FirebaseVertex 的 HTTP 错误归一化成可直接返回给用户的 message。"""
+    if not isinstance(error_message, dict):
+        return {"error": "Gemini HTTP Error", "status_code": 400, "details": str(error_message)}
+
+    status_code = error_message.get("status_code") or 400
+    details = error_message.get("details")
+
+    message = None
+    if isinstance(details, dict):
+        message = (
+            _extract_gemini_block_message(details)
+            or safe_get(details, "error", "message", default=None)
+            or safe_get(details, "message", default=None)
+        )
+    elif isinstance(details, str):
+        message = details
+
+    if not message:
+        message = str(details) if details is not None else str(error_message)
+
+    return {
+        "error": error_message.get("error", "Gemini HTTP Error"),
+        "status_code": int(status_code) if str(status_code).isdigit() else 400,
+        "details": message,
+    }
+
+
+def gemini_json_process(response_json):
+    """处理 Gemini JSON 响应
+    
+    遍历所有 parts 收集：
+    - thought=True 的部分作为 reasoning_content
+    - 普通文本作为 content
+    - inlineData 作为图片
+    - functionCall 作为函数调用
+    """
+    from ..log_config import logger
+    
+    promptTokenCount = 0
+    candidatesTokenCount = 0
+    totalTokenCount = 0
+    image_base64 = None
+    thought_signature = None
+    
+    # 收集所有内容
+    reasoning_parts = []
+    content_parts = []
+    function_call_name = None
+    function_full_response = None
+    # 修改原因：Gemini parts 中可能出现多个 functionCall，旧返回值只能保存第一个。
+    # 修改方式：继续保留旧的 function_call_name/function_full_response，同时新增 function_calls_list 收集全部调用。
+    # 目的：让流式和非流式出口都能逐个分配唯一 id 与独立 index。
+    function_calls_list = []
+
+    json_data = safe_get(response_json, "candidates", 0, "content", default=None)
+    finishReason = safe_get(response_json, "candidates", 0, "finishReason", default=None)
+    
+    parts_data = safe_get(json_data, "parts", default=[])
+    
+    # 遍历所有 parts
+    for part in parts_data:
+        if not isinstance(part, dict):
+            continue
+            
+        # 提取签名 (可能在任何 part 中)
+        sig = part.get("thoughtSignature")
+        if sig:
+            thought_signature = sig
+        
+        # 处理思考内容 (thought=True)
+        if part.get("thought") is True:
+            text = part.get("text", "")
+            if text:
+                reasoning_parts.append(text)
+            continue
+        
+        # 处理普通文本
+        if "text" in part and not part.get("thought"):
+            text = part.get("text", "")
+            if text:
+                content_parts.append(text)
+        
+        # 处理图片
+        if "inlineData" in part:
+            b64_json = safe_get(part, "inlineData", "data", default="")
+            if b64_json:
+                image_base64 = b64_json
+        
+        # 处理函数调用
+        if "functionCall" in part:
+            current_function_call_name = safe_get(part, "functionCall", "name", default=None)
+            current_function_full_response = safe_get(part, "functionCall", "args", default=None)
+            if current_function_call_name:
+                function_calls_list.append({
+                    "name": current_function_call_name,
+                    "args": current_function_full_response,
+                })
+            if function_call_name is None:
+                function_call_name = current_function_call_name
+                function_full_response = current_function_full_response
+
+    if finishReason:
+        promptTokenCount = (safe_get(response_json, "usageMetadata", "promptTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "toolUsePromptTokenCount", default=0) or 0)
+        candidatesTokenCount = (safe_get(response_json, "usageMetadata", "candidatesTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "thoughtsTokenCount", default=0) or 0)
+        totalTokenCount = safe_get(response_json, "usageMetadata", "totalTokenCount", default=0) or (promptTokenCount + candidatesTokenCount)
+        if finishReason != "STOP":
+            logger.error(f"finishReason: {finishReason}")
+
+    # 合并收集到的内容
+    reasoning_content = "".join(reasoning_parts)
+    content = "".join(content_parts)
+    
+    # 清理掉 image_base64 如果没有内容，避免流式无内容触发图像处理
+    if image_base64 and not image_base64.strip():
+        image_base64 = None
+    
+    # 判断是否有思考内容
+    is_thinking = bool(reasoning_parts)
+
+    # 提取 blockReason
+    blockReason = safe_get(response_json, "promptFeedback", "blockReason", default=None)
+    if not blockReason:
+        blockReason = safe_get(response_json, "candidates", 0, "blockReason", default=None)
+
+    return is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list
+
+
+async def fetch_gemini_response(client, url, headers, payload, model, timeout):
+    """处理 Gemini 非流式响应"""
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_gemini_response")
+    if error_message:
+        yield _normalize_gemini_http_error(error_message)
+        return
+
+    response_bytes = await response.aread()
+    if hasattr(response, "_content"):
+        response._content = b""
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    response_bytes = None
+
+    if isinstance(response_json, str):
+        import ast
+        parsed_data = ast.literal_eval(str(response_json))
+    elif isinstance(response_json, list):
+        parsed_data = response_json
+    elif isinstance(response_json, dict):
+        parsed_data = [response_json]
+    else:
+        parsed_data = response_json
+
+    # 检查 blockReason
+    if isinstance(parsed_data, list) and len(parsed_data) > 0:
+        first_resp = parsed_data[0]
+        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(first_resp)
+        if image_base64 and isinstance(first_resp, dict):
+            for _cand in (first_resp.get("candidates") or []):
+                for _p in ((_cand.get("content") or {}).get("parts") or []):
+                    if isinstance(_p, dict) and isinstance(_p.get("inlineData"), dict) and "data" in _p["inlineData"]:
+                        _p["inlineData"]["data"] = "" 
+        
+        if blockReason and blockReason != "STOP":
+            msg = _extract_gemini_block_message(first_resp) or blockReason
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
+            return
+        
+        if not safe_get(first_resp, "candidates") and blockReason:
+            msg = _extract_gemini_block_message(first_resp) or blockReason
+            yield {
+                "error": {
+                    "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason})",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "content_filter"
+                },
+                "status_code": 400
+            }
+            return
+
+        # 获取 usage (可能在最后一个响应对象中)
+        last_resp = parsed_data[-1]
+        usage_metadata = safe_get(last_resp, "usageMetadata")
+        if isinstance(usage_metadata, dict):
+            prompt_tokens = (usage_metadata.get("promptTokenCount", 0) or 0) + (usage_metadata.get("toolUsePromptTokenCount", 0) or 0)
+            candidates_tokens = (usage_metadata.get("candidatesTokenCount", 0) or 0) + (usage_metadata.get("thoughtsTokenCount", 0) or 0)
+            total_tokens = usage_metadata.get("totalTokenCount", 0) or (prompt_tokens + candidates_tokens)
+        else:
+            prompt_tokens = promptTokenCount
+            candidates_tokens = candidatesTokenCount
+            total_tokens = totalTokenCount
+
+        mark_adapter_metrics_managed()
+        # Gemini 的 cachedContentTokenCount 与普通 token 同在 usageMetadata，需要同步写入日志统计和下游响应。
+        cache_usage = extract_cache_usage(usage_metadata)
+        merge_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=candidates_tokens,
+            total_tokens=total_tokens,
+            **cache_usage,
+        )
+
+        # 检查是否返回了有效内容
+        has_content = content and content.strip()
+        has_reasoning = reasoning_content and reasoning_content.strip()
+        has_function_call = bool(function_calls_list)
+        has_image = image_base64 is not None
+        
+        is_image_model = _is_image_model(model)
+        
+        # 图像模型必须有图片
+        if is_image_model and not has_image:
+            yield {
+                "error": "Gemini image generation failed: no image was generated",
+                "status_code": 502,
+                "details": "Gemini image generation failed: no image was generated",
+            }
+            return
+        
+        # 普通模型必须有内容
+        if not is_image_model and not has_content and not has_reasoning and not has_function_call:
+            yield {
+                "error": "Gemini returned empty response",
+                "status_code": 502,
+                "details": "Gemini returned empty response",
+            }
+            return
+
+        role = safe_get(first_resp, "candidates", 0, "content", "role")
+        if role == "model":
+            role = "assistant"
+        elif not role:
+            role = "assistant"
+
+        # 检查是否需要处理图像
+        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片，
+        # 都将其转换为结构化 content list，让方言出口层决定最终格式。
+        if image_base64:
+            try:
+                from ..log_config import logger
+                logger.info(f"[Gemini] Processing image for non-stream response, model={model}")
+                
+                # 构建结构化 content list
+                content_items = []
+                if content:
+                    content_items.append({"type": "text", "text": content})
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                })
+                content = content_items
+                image_base64 = None  # 清除，防止 generate_no_stream_response 返回图像 API 格式
+
+            except Exception as e:
+                from ..log_config import logger
+                logger.error(f"[Gemini] Error processing image in non-stream: {e}")
+                # 出错时保持原样，由 generate_no_stream_response 处理
+
+        if has_content or has_reasoning or has_image or has_function_call:
+            mark_content_start()
+
+        # 修改原因：Gemini 非流式返回多个 functionCall 时，旧调用只会把第一个工具传给统一出口。
+        # 修改方式：把 gemini_json_process 收集到的全部 functionCall 转为 OpenAI tool_calls_list，并为每项生成唯一 call_ id。
+        # 目的：避免多个 Gemini 工具调用共享固定 id 或丢失 index。
+        tool_calls_list = []
+        for function_index, function_call in enumerate(function_calls_list):
+            arguments = function_call.get("args")
+            if not isinstance(arguments, str):
+                arguments = json_dumps_text(arguments, ensure_ascii=False)
+            tool_call = {
+                "index": function_index,
+                "id": f"call_{uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": function_call.get("name", ""),
+                    "arguments": arguments,
+                },
+            }
+            if thought_signature:
+                tool_call["extra_content"] = {"google": {"thoughtSignature": thought_signature}}
+            tool_calls_list.append(tool_call)
+
+        yield await generate_no_stream_response(
+            timestamp, model, content=content,
+            role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
+            completion_tokens=candidates_tokens, reasoning_content=reasoning_content,
+            image_base64=image_base64, thought_signature=thought_signature,
+            # 非流式 Gemini 输出需要继续携带缓存命中字段，供 OAI 与下游方言转换使用。
+            cached_tokens=cache_usage["cached_tokens"],
+            cache_creation_tokens=cache_usage["cache_creation_tokens"],
+            return_dict=True,
+            tool_calls_list=tool_calls_list or None,
+        )
+        return
+
+
+async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
+    """处理 Gemini 流式响应"""
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        error_message = await check_response(response, "fetch_gemini_response_stream")
+        if error_message:
+            yield _normalize_gemini_http_error(error_message)
+            return
+        mark_adapter_metrics_managed()
+        promptTokenCount = 0
+        candidatesTokenCount = 0
+        totalTokenCount = 0
+        # 流式 Gemini 的缓存命中数量跟随 usageMetadata 出现，跨 chunk 保留后写入 current_info。
+        cachedContentTokenCount = 0
+        parts_json = ""
+        
+        # 用于追踪整个流中是否有有效内容
+        has_content = False  # 是否有文本内容
+        has_image = False    # 是否有图片
+        has_function_call = False  # 是否有函数调用
+        has_reasoning = False  # 是否有思维链
+        stream_finished_normally = False  # 是否正常结束
+        # 修改原因：Gemini 流式响应的一个 chunk 可能包含多个 functionCall，旧实现固定工具 id 且无法递增 index。
+        # 修改方式：用 tc_index 为每个 functionCall 分配 OpenAI tool_call_index，并用 uuid4 生成唯一 call_ id。
+        # 目的：让并行工具调用的工具头和参数片段保持一一对应。
+        tc_index = 0
+
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
+            if not line:
+                continue
+
+            if line.startswith("data:"):
+                parts_json = line[5:].strip()
+                try:
+                    response_json = json_loads(parts_json)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                parts_json += line
+                parts_json = parts_json.lstrip("[,")
+                try:
+                    response_json = json_loads(parts_json)
+                except json.JSONDecodeError:
+                    continue
+
+            # 修改原因：Gemini 流内错误（如 RESOURCE_EXHAUSTED 429）不走 candidates 结构，
+            # gemini_json_process 会静默吞掉该信封，导致客户端看到一个正常结束的假流。
+            # 修改方式：在内容解析前优先识别错误信封，产出结构化错误块交给上游 guard 决定重试或记录。
+            # 目的：转换路径与透传路径对 Gemini 流内错误的处理保持一致。
+            stream_error = extract_stream_error(response_json)
+            if stream_error:
+                yield {"error": {k: stream_error[k] for k in ("message", "type", "code")},
+                       "status_code": stream_error["status_code"]}
+                return
+
+            # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
+            is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(response_json)
+                
+            # 调试日志：记录每个 chunk 的关键信息
+            from ..log_config import logger
+            if image_base64:
+                    # 注意：避免在此处直接打印或使用 image_base64，它可能是一个极大的字符串
+                logger.debug(f"[Gemini] image_base64 received, length={len(image_base64)}, finish={finishReason}")
+            # 追踪有效内容（必须在 finishReason 判断之外，每个 chunk 都检查）
+            if is_thinking and reasoning_content:
+                has_reasoning = True
+            if content and content.strip():
+                has_content = True
+            if image_base64:
+                has_image = True
+            if function_calls_list:
+                has_function_call = True
+
+            if finishReason:
+                logger.debug(f"[Gemini] finishReason={finishReason}, has_image={bool(image_base64)}, len={len(content) if content else 0}")
+
+            if totalTokenCount > 0 or promptTokenCount > 0 or candidatesTokenCount > 0:
+                _cache_usage = extract_cache_usage(safe_get(response_json, "usageMetadata", default={}) or {})
+                if _cache_usage["cached_tokens"]:
+                    cachedContentTokenCount = _cache_usage["cached_tokens"]
+                merge_usage(
+                    prompt_tokens=promptTokenCount,
+                    completion_tokens=candidatesTokenCount,
+                    total_tokens=totalTokenCount,
+                    cached_tokens=cachedContentTokenCount,
+                    cache_creation_tokens=_cache_usage["cache_creation_tokens"],
+                )
+
+            if is_thinking:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, reasoning_content=reasoning_content, thought_signature=thought_signature)
+                yield sse_string
+            if not image_base64 and content:
+                mark_content_start()
+                sse_string = await generate_sse_response(timestamp, model, content=content, thought_signature=thought_signature)
+                yield sse_string
+
+            if image_base64:
+                if not _is_image_model(model):
+                    pass # Ignored base64 from non-image model in streaming mode, usually duplicate or not supported by standard SSE
+                else:
+                    image_size_mb = len(image_base64) * 3 / 4 / (1024 * 1024)
+                    logger.debug(f"[Gemini] Processing image, size={image_size_mb:.2f} MB")
+                    # 发送 SSE 注释作为 keepalive，防止客户端超时断开
+                    # 这里不再走图床，统一直接以内联 base64 返回
+                    mark_content_start()
+                    yield ": streaming inline image\n\n"
+
+                    logger.debug("[Gemini] Returning inline base64 image via structured content item")
+                    # 直接发结构化 image content item，方言出口各自转换
+                    image_content_item = [{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                    }]
+                    sse_string = await generate_sse_response(
+                        timestamp, model, content=image_content_item,
+                        thought_signature=thought_signature
+                    )
+                    yield sse_string
+
+
+
+            for function_call in function_calls_list:
+                function_call_name = function_call.get("name", "")
+                if not function_call_name:
+                    continue
+                current_tc_index = tc_index
+                tc_index += 1
+                function_call_id = f"call_{uuid4().hex[:24]}"
+                function_full_response = function_call.get("args")
+                if not isinstance(function_full_response, str):
+                    function_full_response = json_dumps_text(function_full_response, ensure_ascii=False)
+                mark_content_start()
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=function_call_name, thought_signature=thought_signature,
+                    tool_call_index=current_tc_index,
+                )
+                yield sse_string
+                mark_content_start()
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=None, function_call_content=function_full_response,
+                    thought_signature=thought_signature, tool_call_index=current_tc_index,
+                )
+                yield sse_string
+
+
+            if parts_json == "[]" or (blockReason and blockReason != "STOP"):
+                msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] {msg} (Reason: {blockReason or 'SAFETY'})\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"This request was blocked by Gemini safety filters: {msg} (Reason: {blockReason or 'SAFETY'})",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                return
+            elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
+                # 非正常结束原因（如 SAFETY, RECITATION 等）
+                mark_content_start()
+                # 1. 方案 B：发送带拒绝理由的普通 content 加上 finish_reason="content_filter"
+                sse_content_filter = await generate_sse_response(
+                    timestamp, model, content=f"\n[Gemini Safety Block] Restricted generation due to {finishReason}\n", stop="content_filter"
+                )
+                yield sse_content_filter
+
+                # 2. 方案 C：追加标准的 OAI Error 裸 chunk
+                err_payload = {
+                    "error": {
+                        "message": f"Gemini generation stopped by safety filter. Finish Reason: {finishReason}",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "content_filter"
+                    }
+                }
+                yield f"data: {json_dumps_text(err_payload, ensure_ascii=False)}\n\n"
+                return
+            elif finishReason:
+                # 正常结束（STOP 或 MAX_TOKENS）
+                # 注意：部分上游/模型可能会直接返回 finishReason=STOP 但不包含任何内容。
+                # 若在本次流中没有任何有效内容，则不要先发 stop chunk（否则可能被上层判为“空响应”）。
+                stream_finished_normally = True
+
+                if has_content or has_reasoning or has_function_call or has_image:
+                    sse_string = await generate_sse_response(timestamp, model, stop="stop")
+                    yield sse_string
+
+                break
+
+            parts_json = ""
+
+        # 检查图像生成模型是否实际返回了图片
+        # 对于 image 模型，如果只有思维链但没有图片，视为生成失败
+        is_image_model = _is_image_model(model)
+        
+        if is_image_model and not has_image:
+            # 图像生成模型但没有生成图片
+            error_detail = {
+                "reason": "no_image_generated",
+                "has_reasoning": has_reasoning,
+                "has_content": has_content,
+                "model": model,
+                "stream_finished_normally": stream_finished_normally,
+            }
+            logger.warning(f"[Gemini] Image model returned no image: {error_detail}")
+            yield {
+                "error": "Gemini image generation failed: no image was generated",
+                "status_code": 502,
+                "details": "Gemini image generation failed: no image was generated",
+            }
+            return
+        
+        # 检查普通模型是否返回了有效内容
+        if not is_image_model and not has_content and not has_reasoning and not has_function_call:
+            logger.warning(f"[Gemini] Empty response: no content, reasoning, or function call")
+            yield {
+                "error": "Gemini returned empty response",
+                "status_code": 502,
+                "details": "Gemini returned empty response",
+            }
+            return
+
+        # 如果流没有正常结束（没有收到 finishReason），确保发送 finish_reason
+        # 同样：只有当已经产生过有效内容时才补发 stop，避免被上层当成“空响应”。
+        if not stream_finished_normally:
+            logger.warning(f"[Gemini] Stream ended without finishReason, sending stop signal")
+            if has_content or has_reasoning or has_function_call or has_image:
+                sse_string = await generate_sse_response(timestamp, model, stop="stop")
+                yield sse_string
+        
+        # 发送 usage chunk（如果有）
+        if totalTokenCount > 0:
+            sse_string = await generate_sse_response(
+                timestamp, model, None, None, None, None, None,
+                totalTokenCount, promptTokenCount, candidatesTokenCount,
+                # 流式 Gemini 最终 usage chunk 需要带回跨 chunk 保存的 cachedContentTokenCount。
+                cached_tokens=cachedContentTokenCount,
+                cache_creation_tokens=0,
+            )
+            yield sse_string
+
+    yield "data: [DONE]" + end_of_line
+
+
+async def fetch_gemini_models(client, provider):
+    """获取 Gemini API 的模型列表。
+
+    Gemini 的 `models.list` 接口默认只返回一页（通常约 50 条）。这里显式拉取分页，直到没有 nextPageToken。
+    """
+    from ..log_config import logger
+
+    raw_base_url = provider.get('base_url', 'https://generativelanguage.googleapis.com/v1beta')
+    api_key = provider.get('api')
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else None
+
+    from ..utils import resolve_base_url
+    url = resolve_base_url(raw_base_url, '/models')
+
+    headers = {
+        'Content-Type': 'application/json',
+        # 使用请求头认证，避免 URL 参数中的特殊字符问题
+        'x-goog-api-key': api_key,
+    }
+
+    # 尽量减少请求次数：优先用更大的 pageSize；同时加上上限防止异常循环
+    page_size = 1000
+    max_pages = 20
+    max_total = 5000
+
+    models: list[str] = []
+    seen: set[str] = set()
+
+    page_token: str | None = None
+    for _ in range(max_pages):
+        params: dict[str, str | int] = {'pageSize': page_size}
+        if page_token:
+            params['pageToken'] = page_token
+
+        response = await client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+
+        data = response.json()
+        if not isinstance(data, dict):
+            break
+
+        # Gemini 返回格式: {"models": [{"name": "models/gemini-pro", ...}], "nextPageToken": "..."}
+        for m in data.get('models', []) or []:
+            if not isinstance(m, dict):
+                continue
+            name = m.get('name', '')
+            if not isinstance(name, str):
+                continue
+
+            # 移除 "models/" 前缀
+            if name.startswith('models/'):
+                name = name[7:]
+
+            name = name.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            models.append(name)
+
+            if len(models) >= max_total:
+                logger.warning(f"[Gemini] models list truncated at {max_total} items")
+                return models
+
+        page_token = data.get('nextPageToken') or data.get('next_page_token')
+        if not page_token:
+            break
+
+    return models
+
+
+def gemini_stream_classifier(event):
+    """Gemini 协议事件分类：True=可暂存，False=携带输出，None=不表态。
+
+    candidates 帧只含角色/空 parts/usage 时可暂存；
+    出现文本、函数调用或内联图片即视为已输出。
+    """
+    if not isinstance(event, dict) or "candidates" not in event:
+        return None
+    for candidate in event.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            return False
+        parts = (candidate.get("content") or {}).get("parts") or []
+        for part in parts:
+            if not isinstance(part, dict):
+                return False
+            if any(part.get(field) for field in (
+                "text", "functionCall", "function_call", "inlineData", "inline_data",
+                "executableCode", "executable_code", "codeExecutionResult",
+            )):
+                return False
+    return True
+
+
+def register():
+    from .registry import register_channel
+    
+    register_channel(
+        id="gemini",
+        type_name="gemini",
+        default_base_url="https://generativelanguage.googleapis.com/v1beta",
+        auth_header="x-goog-api-key: {api_key}",
+        description="Google Gemini API",
+        request_adapter=get_gemini_payload,
+        passthrough_payload_adapter=patch_passthrough_gemini_payload,
+        response_adapter=fetch_gemini_response,
+        stream_adapter=fetch_gemini_response_stream,
+        stream_event_classifier=gemini_stream_classifier,
+        models_adapter=fetch_gemini_models,
+        source="builtin",
+    )
