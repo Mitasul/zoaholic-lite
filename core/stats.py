@@ -77,6 +77,13 @@ CHANNEL_STATS_PROVIDER_TIMESTAMP_KEY_SUCCESS_REQUEST_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_channel_stats_provider_timestamp_key_success_request "
     "ON channel_stats(provider, timestamp, provider_api_key, success, request_id)"
 )
+# 修改原因：仪表盘全景统计需要按 timestamp 聚合 token、缓存、耗时、首字与成本，回表读取含大字段的 request_stats 页会增加 I/O。
+# 修改方式：增加覆盖常用指标字段的轻量复合索引。
+# 目的：让仪表盘时序、速度、缓存率与热力图聚合直接走覆盖索引扫描。
+REQUEST_STATS_DASHBOARD_COVER_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_request_stats_dashboard_cover "
+    "ON request_stats(timestamp DESC, success, model, provider, prompt_tokens, completion_tokens, total_tokens, cached_tokens, process_time, first_response_time, prompt_price, completion_price)"
+)
 # 修改原因：D1 初始化和 SQLite 启动迁移需要共享同一组性能索引，避免两条数据库路径优化不一致。
 # 修改方式：将 Dashboard、日志列表和渠道分析所需的复合索引集中成不可变元组。
 # 目的：新增实例、旧 SQLite 库重启迁移、D1 初始化都能自动获得相同的查询计划基础。
@@ -84,6 +91,7 @@ STATS_PERFORMANCE_INDEX_SQLS = (
     REQUEST_STATS_TS_PROVIDER_MODEL_INDEX_SQL,
     REQUEST_STATS_MODEL_TIMESTAMP_INDEX_SQL,
     REQUEST_STATS_REQUEST_ID_TOKEN_INDEX_SQL,
+    REQUEST_STATS_DASHBOARD_COVER_INDEX_SQL,
     CHANNEL_STATS_PROVIDER_MODEL_TIMESTAMP_SUCCESS_INDEX_SQL,
     CHANNEL_STATS_PROVIDER_TIMESTAMP_KEY_SUCCESS_REQUEST_INDEX_SQL,
 )
