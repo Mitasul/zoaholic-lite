@@ -20,14 +20,20 @@ def static_app(tmp_path, monkeypatch):
     (static / "icons" / "logo.txt").write_text("public icon")
     (static / "robots.txt").write_text("User-agent: *")
     (root / "outside.txt").write_text("must not be disclosed")
-    (static / "escape.txt").symlink_to(root / "outside.txt")
-    (static / "assets" / "escape.txt").symlink_to(root / "outside.txt")
-    (static / "icons" / "escape.txt").symlink_to(root / "outside.txt")
-    (static / "loop").symlink_to(static / "loop")
+    symlinks_supported = True
+    try:
+        (static / "escape.txt").symlink_to(root / "outside.txt")
+        (static / "assets" / "escape.txt").symlink_to(root / "outside.txt")
+        (static / "icons" / "escape.txt").symlink_to(root / "outside.txt")
+        (static / "loop").symlink_to(static / "loop")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        symlinks_supported = False
     monkeypatch.chdir(root)
 
     source = Path(__file__).resolve().parents[1] / "main.py"
-    tree = ast.parse(source.read_text())
+    tree = ast.parse(source.read_text(encoding="utf-8"))
     # Preserve actual registration order and definitions, without app startup.
     nodes = []
     active = False
@@ -43,7 +49,7 @@ def static_app(tmp_path, monkeypatch):
     namespace = {"app": app, "Path": Path, "StaticFiles": StaticFiles, "FileResponse": FileResponse,
                  "JSONResponse": JSONResponse, "HTTPException": HTTPException}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
-    return app, static
+    return app, static, symlinks_supported
 
 
 @pytest.mark.asyncio
@@ -54,7 +60,9 @@ def static_app(tmp_path, monkeypatch):
     "/%00.txt", "/escape.txt", "/assets/escape.txt", "/icons/escape.txt", "/loop",
 ])
 async def test_unauthenticated_traversal_and_symlinks_are_rejected(static_app, path):
-    app, _ = static_app
+    app, _, symlinks_supported = static_app
+    if not symlinks_supported and path in ("/escape.txt", "/assets/escape.txt", "/icons/escape.txt", "/loop"):
+        pytest.skip("Windows symlink privilege unavailable")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway.test") as client:
         response = await client.get(path)
     assert response.status_code == 404
@@ -70,7 +78,7 @@ async def test_unauthenticated_traversal_and_symlinks_are_rejected(static_app, p
     ("/robots.txt", "User-agent: *"),
 ])
 async def test_public_assets_and_spa_remain_available(static_app, path, content):
-    app, _ = static_app
+    app, _, _ = static_app
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway.test") as client:
         response = await client.get(path)
     assert response.status_code == 200
@@ -83,7 +91,9 @@ async def test_public_assets_and_spa_remain_available(static_app, path, content)
 
 @pytest.mark.asyncio
 async def test_index_symlink_cannot_escape(static_app):
-    app, static = static_app
+    app, static, symlinks_supported = static_app
+    if not symlinks_supported:
+        pytest.skip("Windows symlink privilege unavailable")
     (static / "index.html").unlink()
     (static / "index.html").symlink_to(static.parent / "outside.txt")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway.test") as client:
@@ -93,7 +103,7 @@ async def test_index_symlink_cannot_escape(static_app):
 
 @pytest.mark.asyncio
 async def test_asset_conditional_cache_and_missing_file(static_app):
-    app, _ = static_app
+    app, _, _ = static_app
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway.test") as client:
         first = await client.get("/assets/app.js")
         cached = await client.get("/assets/app.js", headers={"If-None-Match": first.headers["etag"]})
@@ -105,7 +115,7 @@ async def test_asset_conditional_cache_and_missing_file(static_app):
 
 
 def test_static_mounts_precede_catch_all(static_app):
-    app, _ = static_app
+    app, _, _ = static_app
     paths = [route.path for route in app.routes]
     assert paths.index("/assets") < paths.index("/{path:path}")
     assert paths.index("/icons") < paths.index("/{path:path}")

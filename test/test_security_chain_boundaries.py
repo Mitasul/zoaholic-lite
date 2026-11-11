@@ -54,7 +54,13 @@ def test_workspace_sibling_prefix_symlink_is_not_inside_root(tmp_path, monkeypat
     (root / "data").mkdir(parents=True)
     sibling.mkdir()
     (sibling / "marker.txt").write_text("outside")
-    (root / "data" / "external").symlink_to(sibling, target_is_directory=True)
+    try:
+        (root / "data" / "external").symlink_to(sibling, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        import _winapi
+        _winapi.CreateJunction(str(sibling), str(root / "data" / "external"))
     monkeypatch.setattr(workspace, "PROJECT_ROOT", root)
     with pytest.raises(HTTPException) as error:
         workspace._resolve_path("data/external/marker.txt")

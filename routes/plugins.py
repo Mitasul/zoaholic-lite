@@ -34,10 +34,20 @@ def _validate_plugin_name(name: str) -> None:
         raise HTTPException(400, "Plugin filename must be a plain filename without a path")
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
 def _plugin_upload_root() -> Path:
     root = PLUGINS_DIR.absolute()
-    # Do not follow an existing symlink in the configured installation path.
-    if any(path.is_symlink() for path in (root, *root.parents)):
+    # Do not follow an existing symlink or Windows NTFS junction in the configured installation path.
+    if any(_is_link_or_reparse(path) for path in (root, *root.parents)):
         raise HTTPException(400, "Plugin installation directory cannot contain symlinks")
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
@@ -46,7 +56,7 @@ def _plugin_upload_root() -> Path:
 def _plugin_upload_target(root: Path, name: str, *, directory: bool) -> Path:
     _validate_plugin_name(name)
     target = root / name
-    if target.is_symlink() or not target.resolve().is_relative_to(root):
+    if _is_link_or_reparse(target) or not target.resolve().is_relative_to(root):
         raise HTTPException(400, "Plugin target is outside the installation directory")
     if target.exists() and target.is_dir() != directory:
         raise HTTPException(400, "Plugin target has a conflicting file type")
@@ -103,7 +113,12 @@ def _extract_plugin_zip(archive_path: Path, destination: Path) -> None:
 
 
 def _remove_upload_target(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
+    if _is_link_or_reparse(path):
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink()
+    elif path.is_file():
         path.unlink()
     elif path.exists():
         shutil.rmtree(path)

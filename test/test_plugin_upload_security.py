@@ -17,8 +17,27 @@ def archive(entries):
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as output:
         for name, body in entries:
-            output.writestr(name, body)
+            if isinstance(name, str):
+                info = zipfile.ZipInfo("entry")
+                info.filename = name
+                info.compress_type = zipfile.ZIP_DEFLATED
+                output.writestr(info, body)
+            else:
+                output.writestr(name, body)
     return stream.getvalue()
+
+
+def _make_link(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            if target_is_directory:
+                import _winapi
+                _winapi.CreateJunction(str(target), str(link))
+                return
+            pytest.skip("Windows file symlink privilege (SeCreateSymbolicLinkPrivilege) unavailable")
+        raise
 
 
 @pytest.fixture
@@ -120,11 +139,11 @@ async def test_existing_target_symlink_is_not_followed(install_env, directory):
     if directory:
         outside.mkdir()
         (outside / "keep.txt").write_text("keep")
-        (root / "package").symlink_to(outside, target_is_directory=True)
+        _make_link(root / "package", outside, target_is_directory=True)
         filename, body = "bundle.zip", archive([("package/main.py", b"code")])
     else:
         outside.write_text("keep")
-        (root / "plugin.py").symlink_to(outside)
+        _make_link(root / "plugin.py", outside)
         filename, body = "plugin.py", b"code"
     with pytest.raises(HTTPException) as exc:
         await upload(filename, body)
@@ -139,7 +158,7 @@ async def test_symlink_in_install_root_ancestors_rejected(install_env, monkeypat
     outside = root.parent / "outside"
     outside.mkdir()
     link = root.parent / "linked"
-    link.symlink_to(outside, target_is_directory=True)
+    _make_link(link, outside, target_is_directory=True)
     monkeypatch.setattr(plugins, "PLUGINS_DIR", link / "plugins")
     with pytest.raises(HTTPException) as exc:
         await upload("plugin.py")
@@ -179,7 +198,7 @@ async def test_failed_zip_load_restores_directory_without_following_old_links(in
     (target / "old.py").write_text("original")
     external = root.parent / "external"
     external.write_text("untouched")
-    (target / "old-link").symlink_to(external)
+    _make_link(target / "old-link", external)
     result.error = "failed"
     with pytest.raises(HTTPException):
         await upload("bundle.zip", archive([("package/main.py", b"replacement")]))
