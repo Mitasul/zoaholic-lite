@@ -2,6 +2,7 @@
 针对安全审计报告 (VULN-01 ~ VULN-17) 中全部真实漏洞修复的回归测试。
 """
 
+import asyncio
 import base64
 from pathlib import Path
 from types import SimpleNamespace
@@ -223,4 +224,94 @@ async def test_vuln13_model_path_traversal_and_follow_redirects_disabled():
         with pytest.raises(HTTPException) as exc_info:
             await handler.request_model(req, api_index=0, background_tasks=SimpleNamespace())
         assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_prepare_stream_releases_keepalive_after_45s_for_cloudflare_524(monkeypatch):
+    from core import stream_pipeline
+
+    gate = asyncio.Event()
+
+    async def slow_upstream():
+        await gate.wait()
+        yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+
+    clock = [100.0]
+
+    def fake_monotonic():
+        val = clock[0]
+        clock[0] += 25.0
+        return val
+
+    monkeypatch.setattr(stream_pipeline.time_module, "monotonic", fake_monotonic)
+
+    async def fake_wait_for_timeout(gen, timeout=3, wait_task=None):
+        task = wait_task or asyncio.create_task(gen.__anext__())
+        return task, "timeout"
+
+    monkeypatch.setattr(stream_pipeline, "wait_for_timeout", fake_wait_for_timeout)
+
+    info = {}
+    stream_iter, elapsed = await stream_pipeline.prepare_stream(
+        slow_upstream(),
+        current_info=info,
+        keepalive_interval=15,
+        stream_header_timeout=300,
+    )
+    first_frame = await stream_iter.__anext__()
+    assert first_frame == ": keepalive\n\n"
+    gate.set()
+    await stream_iter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_handler_aborts_retry_when_client_disconnected(monkeypatch):
+    from core.handler import ModelRequestHandler
+    from core.models import RequestModel
+
+    attempts_made = []
+
+    async def fake_process_request(*args, **kwargs):
+        attempts_made.append(1)
+        raise HTTPException(status_code=502, detail="upstream error")
+
+    monkeypatch.setattr("core.handler.process_request", fake_process_request)
+    monkeypatch.setattr("core.handler.enqueue_stats", lambda *a, **kw: None)
+
+    provider = {
+        "provider": "slow-ch",
+        "engine": "openai",
+        "base_url": "https://api.example.com/v1",
+        "api": ["key-1", "key-2", "key-3"],
+        "model": ["gpt-4o"],
+        "_model_dict_cache": {"gpt-4o": "gpt-4o"},
+    }
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            config={"preferences": {}, "providers": [provider], "api_keys": [{"api": "zk-user", "model": ["all"]}]},
+            api_list=["zk-user"],
+            provider_timeouts={"global": {"default": 60}},
+            keepalive_interval={"global": {"default": 15}},
+            error_triggers=[],
+            channel_manager=SimpleNamespace(cooldown_period=0),
+        )
+    )
+    handler = ModelRequestHandler(app, lambda: {}, AsyncMock())
+
+    class DisconnectedRawRequest:
+        async def is_disconnected(self):
+            return True
+
+    req = RequestModel(model="gpt-4o", stream=True, messages=[{"role": "user", "content": "hi"}])
+    with pytest.raises(asyncio.CancelledError):
+        await handler.request_model(
+            req,
+            api_index=0,
+            background_tasks=SimpleNamespace(),
+            override_providers=[provider],
+            override_auto_retry=True,
+            raw_request=DisconnectedRawRequest(),
+        )
+    assert len(attempts_made) == 1
+
 

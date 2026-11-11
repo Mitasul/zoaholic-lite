@@ -223,7 +223,7 @@ async def prepare_stream(generator, *, current_info=None, keepalive_interval=Non
                     break
                 # status == "timeout"
                 wait_task = item_or_task
-                if info.get("_upstream_first_byte_ok") and keepalive_interval:
+                if keepalive_interval and (info.get("_upstream_first_byte_ok") or (time_module.monotonic() - start) >= 45.0):
                     pending, first = wait_task, None
                     break
                 now_after = time_module.monotonic()
