@@ -120,8 +120,6 @@ def _parse_claude_tools_options(provider: Dict[str, Any]) -> Dict[str, Any]:
 
 def _strip_billing_header_from_text(text: str) -> str:
     """剥离文本最前面的一行 x-anthropic-billing-header:...（兼容有无换行符及 \r\n / \n）。"""
-    if not isinstance(text, str):
-        return text
     if not text.lstrip().startswith("x-anthropic-billing-header:"):
         return text
     return _BILLING_HEADER_FIRST_LINE_RE.sub("", text, count=1)
@@ -197,7 +195,7 @@ def strip_claude_code_fingerprint(headers: Dict[str, Any], payload: Dict[str, An
                     del headers[k]
 
 
-def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
+def parse_model_suffixes(model: Optional[str]) -> Tuple[Optional[str], Set[str], Optional[int]]:
     if not isinstance(model, str):
         return model, set(), None
 
@@ -236,7 +234,7 @@ def parse_model_suffixes(model: str) -> Tuple[str, Set[str], Optional[int]]:
     return remaining, enabled_features, thinking_budget
 
 
-def is_claude_engine(engine: str) -> bool:
+def is_claude_engine(engine: Optional[str]) -> bool:
     if not isinstance(engine, str):
         return False
     engine_lower = engine.lower()

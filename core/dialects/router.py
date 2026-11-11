@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 
-def _flatten_stream_content(sse_chunk: str) -> str:
+def _flatten_stream_content(sse_chunk: Any) -> Any:
     """将 SSE chunk 中结构化的 delta.content list 拍扁为 markdown 字符串。
 
     作为方言基类的默认行为：不支持结构化图片的方言（OAI/Claude/Responses）
@@ -91,7 +91,7 @@ async def _read_response_bytes(resp: "Response") -> bytes:
 
 def _create_dialect_verify_api_key(dialect_id: str):
     """为方言创建 API key 验证依赖"""
-    from core.auth import _extract_token, authenticate_api_key_token, security
+    from core.auth import authenticate_api_key_token, extract_token, security
     from core.ip_blacklist import (
         get_client_ip_from_request_info,
         is_global_ip_blocked,
@@ -119,7 +119,7 @@ def _create_dialect_verify_api_key(dialect_id: str):
 
         # 否则使用默认提取器
         if not token:
-            token = await _extract_token(request, credentials)
+            token = await extract_token(request, credentials)
 
         return authenticate_api_key_token(app, token, client_ip, request=request)
 
@@ -158,6 +158,12 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         path_params = dict(request.path_params)
         if ":" in request.url.path:
             path_params["action"] = request.url.path.split(":")[-1]
+
+        from core.utils import is_valid_model_name
+
+        raw_path_model = str(path_params.get("model") or "")
+        if raw_path_model and not is_valid_model_name(raw_path_model, check_encoded=True):
+            return openai_error_response("Invalid model name in URL path", 400)
 
         canonical_request = await dialect.parse_request(native_body, path_params, headers)
 

@@ -77,20 +77,13 @@ def _collect_key_candidates(raw_keys: Any) -> list[str]:
 
 def _get_test_model_name(test_config: Dict[str, Any]) -> str:
     """读取测试请求模型名，优先使用内部已解析模型名。"""
-    # 修改原因：model_prefix 渠道可能需要把前端传入的无前缀模型名解析为带前缀的外部模型名。
-    # 修改方式：provider 构建阶段可写入 _resolved_test_model，请求构建阶段优先读取它。
-    # 目的：在不改变公开请求体格式的前提下，让拆分后的 provider 构建和 request 构建共享解析结果。
-    model = (
-        test_config.get("_resolved_test_model")
-        or test_config.get("model")
-        or test_config.get("model_alias")
-        or test_config.get("upstream_model")
-        or ""
-    )
-    model = str(model).strip()
-    if not model:
-        raise HTTPException(status_code=400, detail="model 是必填项")
-    return model
+    for key in ("_resolved_test_model", "model", "model_alias", "upstream_model"):
+        raw = test_config.get(key)
+        if raw is not None:
+            model = str(raw).strip()
+            if model:
+                return model
+    raise HTTPException(status_code=400, detail="model 是必填项")
 
 
 def _get_upstream_model_hint(test_config: Dict[str, Any]) -> Optional[str]:
@@ -392,12 +385,8 @@ async def _extract_test_result(response: Any, start_time: float) -> Dict[str, An
 @router.get("/v1/playground/keys", dependencies=[Depends(rate_limit_dependency)])
 async def get_playground_keys(token: str = Depends(verify_admin_api_key)):
     """返回 Playground 可切换的全局用户 API Key 列表。"""
-    # 修改原因：Playground Key 选择需要模拟不同 api.yaml 用户身份，而不是指定 provider 上游密钥。
-    # 修改方式：只读取全局 api_keys，返回显示名、脱敏文本和完整 api；该端点仍由管理员认证保护。
-    # 目的：让 chat 和 models 请求都能用所选用户的 Bearer token 重新鉴权，并解除 Key 列表与 model 的耦合。
-    _ = token
     app = get_app()
-    config = getattr(getattr(app, "state", None), "config", None) or {}
+    config = getattr(app.state, "config", None) or {}
     api_keys = config.get("api_keys") or []
 
     keys = []
@@ -540,7 +529,7 @@ async def fetch_channel_models(
         logger.info(f"Auto-prefixed base_url: {provider['base_url']}")
     
     # OAuth 渠道：api 字段是邮箱/key_id，路由层统一 resolve 成 access_token
-    if getattr(channel, "is_oauth", False) and hasattr(app.state, "oauth_manager"):
+    if channel.is_oauth and hasattr(app.state, "oauth_manager"):
         # 修改原因：oauth_state 第一层 key 是用户配置的 provider 名，不是 engine；Antigravity 的 key 可能是任意自定义名称（如 “my-antigravity”）。
         # 修改方式：先把 api/api_key 归一为 key_id 候选，再遍历 OAuthManager._state 的所有 channel_id 调 resolve。
         # 目的：models_adapter 只接收已经解析好的 access_token，保持签名为 (client, provider) 且不自行做 OAuth 查找。
@@ -1003,7 +992,7 @@ async def _query_oauth_channel_balance(app: Any, provider: Dict[str, Any]) -> Di
             for key_id in key_ids
         })
 
-    oauth_manager = getattr(getattr(app, "state", None), "oauth_manager", None)
+    oauth_manager = getattr(app.state, "oauth_manager", None) if app is not None else None
     fetch_quota = getattr(oauth_manager, "fetch_quota", None)
     if not callable(fetch_quota):
         return _aggregate_oauth_balance_results({

@@ -97,10 +97,7 @@ def _append_literal_model_rules(
 
 def _is_virtual_model_authorized(request_model: str, config: Dict[str, Any], api_index: int) -> bool:
     """判断当前 API Key 是否允许访问虚拟模型名。"""
-    # 修改原因：虚拟模型只是新的模型名入口，必须复用 API Key 的 model 授权数组。
-    # 修改方式：只接受 "all" 或与虚拟模型名完全相同的 model 规则。
-    # 目的：避免虚拟模型绕过现有 API Key 授权边界。
-    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=[]) or []
+    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=None) or []
     for rule in model_rules:
         if isinstance(rule, dict) and rule:
             rule = next(iter(rule.keys()))

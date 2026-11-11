@@ -174,7 +174,7 @@ async def list_models(request: Request, api_index: int = Depends(verify_api_key)
       verify_api_key 会将其映射为配置中的 admin api_key index，从而也能正常拿到模型列表。
     - BYOK 请求使用通配符模板身份计费，provider.model=["*"] 且有 models_adapter 时用真实上游 key 动态拉取模型。
     """
-    app = request.app if request is not None else get_app()
+    app = request.app
     models = await build_models_for_request(api_index, app)
     return JSONResponse(content={
         "object": "list",

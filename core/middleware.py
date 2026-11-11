@@ -31,7 +31,12 @@ from core.metrics import on_request_start, on_request_end, on_request_model
 from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
-from core.ip_blacklist import ip_blocked_error_response, is_global_ip_blocked, is_key_ip_blocked
+from core.ip_blacklist import (
+    extract_client_ip,
+    ip_blocked_error_response,
+    is_global_ip_blocked,
+    is_key_ip_blocked,
+)
 from core.byok import (
     get_byok_prefixes,
     reset_byok_context,
@@ -86,7 +91,7 @@ async def get_api_key(request: Request) -> Optional[str]:
     return token
 
 
-def should_attempt_unified_request(body: dict) -> bool:
+def should_attempt_unified_request(body: Any) -> bool:
     """
     仅当 body 含统一请求特征字段时才尝试解析 UnifiedRequest。
     避免对渠道管理等非统一 JSON 路由误触发解析。
@@ -167,25 +172,10 @@ class StatsMiddleware:
 
     @staticmethod
     def _get_client_ip(scope: Scope, headers: list) -> str:
-        """
-        获取客户端真实 IP。
-        优先级：X-Forwarded-For > X-Real-IP > scope["client"]
-        """
+        """获取客户端真实 IP（统一委托 core.ip_blacklist.extract_client_ip）。"""
         headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
-
-        # X-Forwarded-For: client, proxy1, proxy2 —— 取第一个
-        forwarded_for = headers_dict.get("x-forwarded-for")
-        if forwarded_for:
-            real_ip = forwarded_for.split(",")[0].strip()
-            if real_ip:
-                return real_ip
-
-        real_ip_header = headers_dict.get("x-real-ip")
-        if real_ip_header:
-            return real_ip_header.strip()
-
         client = scope.get("client")
-        return client[0] if client else "unknown"
+        return extract_client_ip(headers_dict, client[0] if client else "unknown")
 
     def _normalize_endpoint(self, method: str, path: str) -> str:
         """归一化端点路径，将带模型名的路径转换为模板格式"""
@@ -231,10 +221,9 @@ class StatsMiddleware:
 
         # 数据库压缩期间挂起请求（不返回错误，等压缩完自动放行）
         try:
-            from main import _db_ready
-            if not _db_ready.is_set():
-                
-                await asyncio.wait_for(_db_ready.wait(), timeout=30)
+            from main import db_ready
+            if not db_ready.is_set():
+                await asyncio.wait_for(db_ready.wait(), timeout=30)
         except (ImportError, asyncio.TimeoutError):
             pass
 

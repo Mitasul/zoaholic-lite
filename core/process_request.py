@@ -80,7 +80,7 @@ async def process_request(
     # 修改原因：core.handler 顶层需要重新导出 process_request，顶层反向导入 handler 状态会形成循环导入。
     # 修改方式：在请求执行时延迟导入 handler 中保留的 helper 和 debug 标志。
     # 目的：共享 set_debug_mode、OAuth 解析和统计写入逻辑，同时避免模块初始化时互相等待。
-    from core.handler import _fire_and_forget_channel_stats, _resolve_oauth_api_key, is_debug
+    from core.handler import fire_and_forget_channel_stats, resolve_oauth_api_key, is_debug
 
     timeout_value = int(timeout_value)
     model_dict = get_model_dict(provider)
@@ -129,7 +129,7 @@ async def process_request(
     # 修改方式：在请求早期写入 _oauth_channel_id，并把同一 channel_id 传给 OAuthManager.resolve。
     # 目的：让 access_token 解析和 quota 回写都只作用于当前渠道。
     current_info_early["_oauth_channel_id"] = channel_id
-    api_key = await _resolve_oauth_api_key(app, api_key, channel_id=channel_id)
+    api_key = await resolve_oauth_api_key(app, api_key, channel_id=channel_id)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
 
@@ -174,7 +174,7 @@ async def process_request(
         except Exception as e:
             logger.error(f"Error saving upstream request data: {str(e)}")
     # 确保日志中一定记录模型名（使用当前请求对象上的 model）
-    if hasattr(request, "model") and getattr(request, "model", None):
+    if request.model:
         current_info["model"] = request.model
     
     # 记录渠道ID和上游key索引
@@ -340,7 +340,7 @@ async def process_request(
                     update_channel_stats_func, stats_args, {"provider_api_key": original_api_key},
                 )
             else:
-                _fire_and_forget_channel_stats(
+                fire_and_forget_channel_stats(
                     update_channel_stats_func, *stats_args, success=True,
                     provider_api_key=original_api_key,
                 )
@@ -353,7 +353,7 @@ async def process_request(
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
             httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
             httpx.ConnectError) as e:
-        _fire_and_forget_channel_stats(
+        fire_and_forget_channel_stats(
             update_channel_stats_func,
             current_info["request_id"],
             channel_id,

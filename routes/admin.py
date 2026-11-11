@@ -59,6 +59,9 @@ def _rebuild_runtime_rate_limits(app) -> None:
     if quota_registry is not None:
         quota_registry.init_from_config(config)
 
+    from core.auth import list_admin_api_keys
+    app.state.admin_api_key = list_admin_api_keys(api_keys)
+
 
 def _validate_preferences(preferences, owner: str) -> None:
     """Reject malformed limits before runtime normalization or persistence."""
@@ -113,12 +116,21 @@ def _validate_candidate_shape(config: dict) -> None:
                             validate_timeout_preferences(preferences, "sub_channels")
 
 
-async def _persist_config(app, sections_to_verify=None, changed_providers=None, *, candidate_config=None):
+async def persist_config(app, sections_to_verify=None, changed_providers=None, *, candidate_config=None):
     """Prepare and persist privately, then publish runtime fields without awaiting.
 
     External file/DB writes are not a distributed transaction: a storage failure
     may require reconciliation, but it never publishes an unverified candidate.
     """
+    if _persist_config is not _default_persist_config:
+        kwargs = {}
+        if sections_to_verify is not None:
+            kwargs["sections_to_verify"] = sections_to_verify
+        if changed_providers is not None:
+            kwargs["changed_providers"] = changed_providers
+        if candidate_config is not None:
+            kwargs["candidate_config"] = candidate_config
+        return await _persist_config(app, **kwargs)
     from copy import copy
     from types import SimpleNamespace
     from core.byok import build_byok_prefixes
@@ -126,7 +138,7 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None, 
     from core.config.file_store import save_api_yaml
     from core.config.db_store import save_config_to_db
     from core.log_config import logger
-    from utils import _sanitize_config_for_persistence
+    from utils import sanitize_config_for_persistence
 
     sections_to_verify = list(sections_to_verify) if sections_to_verify is not None else ["providers"]
     config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
@@ -135,7 +147,7 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None, 
     source = app.state.config if candidate_config is None else candidate_config
     try:
         _validate_candidate_shape(source)
-        candidate = _sanitize_config_for_persistence(source)
+        candidate = sanitize_config_for_persistence(source)
         config, keys, api_list = await update_config(
             candidate, use_config_url=False, skip_model_fetch=True,
             save_to_file=False, save_to_db=False, changed_providers=changed_providers,
@@ -192,8 +204,12 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None, 
             "api_yaml_path": API_YAML_PATH if save_to_file else None}
 
 
+_default_persist_config = persist_config
+_persist_config = persist_config
+
+
 @router.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
-async def generate_api_key():
+async def generate_api_key(_: str = Depends(verify_admin_api_key)):
     """
     生成新的 API Key
     """
@@ -212,8 +228,8 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
     """
     app = get_app()
     # 过滤运行时字段和展开的子渠道，返回可持久化的配置
-    from utils import _sanitize_config_for_persistence
-    clean_config = _sanitize_config_for_persistence(app.state.config)
+    from utils import sanitize_config_for_persistence
+    clean_config = sanitize_config_for_persistence(app.state.config)
     encoded_config = jsonable_encoder(clean_config)
     effective_keys = {
         key["id"]: {field: value for field, value in key.items() if not field.startswith("_") and field != "api"}
@@ -238,8 +254,8 @@ async def api_config_update(
     updated = False
     # 先在独立候选配置上完成关系校验，失败不能污染正在服务的配置。
     from core.key_hierarchy import prepare_key_hierarchy, raw_key_config
-    from utils import _sanitize_config_for_persistence
-    candidate_config = _sanitize_config_for_persistence(app.state.config)
+    from utils import sanitize_config_for_persistence
+    candidate_config = sanitize_config_for_persistence(app.state.config)
 
     replace_all = bool(config.get("replace_all") or config.get("force_shrink"))
 
@@ -248,8 +264,7 @@ async def api_config_update(
         incoming_providers = config["providers"]
         if not isinstance(incoming_providers, list):
             raise HTTPException(status_code=400, detail="providers must be a list.")
-        from utils import _sanitize_config_for_persistence
-        existing_providers = (_sanitize_config_for_persistence({"providers": app.state.config.get("providers") or []}).get("providers") or [])
+        existing_providers = (sanitize_config_for_persistence({"providers": app.state.config.get("providers") or []}).get("providers") or [])
         if not replace_all and len(existing_providers) > 5:
             if len(incoming_providers) == 0:
                 raise HTTPException(
@@ -377,8 +392,8 @@ async def api_config_update(
         candidate_config["api_keys"] = [raw_key_config(key) for key in prepared]
     except (ValueError, TypeError) as exc:
         raise HTTPException(400, str(exc)) from exc
-    persisted = await _persist_config(app, sections_to_verify=sections_to_verify,
-                                      candidate_config=candidate_config)
+    persisted = await persist_config(app, sections_to_verify=sections_to_verify,
+                                     candidate_config=candidate_config)
 
     return JSONResponse(content={
         "message": "API config updated",
@@ -437,7 +452,7 @@ async def create_provider(
 
     providers.append(provider_data)
     # 增量重建：只重建新增的渠道
-    await _persist_config(app, changed_providers={provider_name}, candidate_config=candidate)
+    await persist_config(app, changed_providers={provider_name}, candidate_config=candidate)
     return JSONResponse(
         status_code=201,
         content={"message": "Provider created", "provider_id": provider_name},
@@ -458,8 +473,8 @@ async def get_provider(
     if provider_index == -1:
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
 
-    from utils import _sanitize_config_for_persistence
-    clean = _sanitize_config_for_persistence({"providers": [providers[provider_index]]})
+    from utils import sanitize_config_for_persistence
+    clean = sanitize_config_for_persistence({"providers": [providers[provider_index]]})
     provider_clean = clean["providers"][0] if clean.get("providers") else providers[provider_index]
     return JSONResponse(content={"provider": jsonable_encoder(provider_clean)})
 
@@ -494,7 +509,7 @@ async def update_provider(
     # 增量重建：只重建被修改的渠道的 CircularList，其他保持不动
     new_provider_name = provider_data.get('provider') or provider_id
     changed = {provider_id, new_provider_name}  # 支持重命名：旧名+新名
-    await _persist_config(app, changed_providers=changed, candidate_config=candidate)
+    await persist_config(app, changed_providers=changed, candidate_config=candidate)
     return JSONResponse(content={"message": "Provider updated", "provider_id": provider_id})
 
 
@@ -518,5 +533,5 @@ async def delete_provider(
 
     providers.pop(provider_index)
     # 删除不需要重建任何 CircularList，但传空 set 会跳过所有重建
-    await _persist_config(app, changed_providers=set(), candidate_config=candidate)
+    await persist_config(app, changed_providers=set(), candidate_config=candidate)
     return JSONResponse(content={"message": "Provider deleted", "provider_id": provider_id})

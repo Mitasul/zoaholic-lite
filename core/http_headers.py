@@ -1,11 +1,10 @@
 """HTTP header 合并工具。"""
 
 
-# 迁移说明：
-# 修改原因：该模块承载业务逻辑，不应继续放在 utils_pkg 这种通用工具包中。
-# 修改方式：按照 Scout 的归位方案迁移到 core 对应业务模块，并只调整必要的内部导入路径。
-# 目的：让业务代码按领域归属维护，同时保留根 utils.py 和 utils_pkg shim 的旧导入兼容性。
-def has_header_case_insensitive(headers: dict, key: str) -> bool:
+from typing import Optional
+
+
+def has_header_case_insensitive(headers: Optional[dict], key: str) -> bool:
     """大小写无关地检查请求头是否存在。"""
     if not isinstance(headers, dict):
         return False
@@ -14,7 +13,7 @@ def has_header_case_insensitive(headers: dict, key: str) -> bool:
     return any(str(existing_key).lower() == key_lower for existing_key in headers.keys())
 
 
-def _set_header_case_insensitive(headers: dict, key: str, value) -> None:
+def _set_header_case_insensitive(headers: Optional[dict], key: str, value) -> None:
     """大小写无关地写入请求头，避免 Content-Type/content-type 一类重复键。"""
     if not isinstance(headers, dict):
         return
@@ -36,7 +35,7 @@ def _set_header_case_insensitive(headers: dict, key: str, value) -> None:
         headers[target_key] = normalized_value
 
 
-def apply_custom_headers(headers: dict, custom_headers: dict) -> None:
+def apply_custom_headers(headers: dict, custom_headers: Optional[dict]) -> None:
     """将渠道自定义 headers 合并到请求头中。
 
     custom_headers 的值支持两种格式：

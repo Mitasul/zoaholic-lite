@@ -108,8 +108,9 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT,
     return result
 
 # ---- 数据库压缩闸门 ----
-_db_ready = asyncio.Event()
-_db_ready.set()  # 初始状态：放行
+db_ready = asyncio.Event()
+db_ready.set()  # 初始状态：放行
+_db_ready = db_ready
 _last_compact_date = None  # 每天最多压缩一次
 
 
@@ -689,14 +690,10 @@ async def lifespan(app: FastAPI):
             app.state.needs_setup = True
             app.state.admin_api_key = []
         else:
-            app.state.admin_api_key = []
-            for item in app.state.api_keys_db:
-                if "admin" in item.get("role", ""):
-                    app.state.admin_api_key.append(item.get("api"))
-            if app.state.admin_api_key == []:
-                # 兼容旧配置：如果没显式标记 admin，就默认第一把 key 为 admin
-                if len(app.state.api_keys_db) >= 1:
-                    app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
+            from core.auth import list_admin_api_keys
+            app.state.admin_api_key = list_admin_api_keys(app.state.api_keys_db)
+            if not app.state.admin_api_key:
+                logger.warning("No API key with role='admin' configured in api_keys; admin API key list remains empty.")
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
@@ -745,7 +742,7 @@ async def lifespan(app: FastAPI):
             },
             "http2": False,
             "verify": True,
-            "follow_redirects": True
+            "follow_redirects": False
         }
 
         # 初始化客户端管理器（增加连接池以支持长时间请求）
@@ -968,6 +965,8 @@ async def lifespan(app: FastAPI):
             pass
     
     app.state.startup_completed = False
+    if hasattr(app.state, 'oauth_manager'):
+        app.state.oauth_manager.stop_proactive_refresh()
     if hasattr(app.state, 'block_watchdog'):
         try:
             await app.state.block_watchdog.stop()

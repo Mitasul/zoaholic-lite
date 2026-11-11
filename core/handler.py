@@ -11,12 +11,17 @@
 # 目的：保持兼容，不要求调用方修改导入路径。
 from core.process_request import process_request
 from core.passthrough import (
-    _filter_passthrough_headers,
-    _fetch_passthrough_stream,
-    _fetch_passthrough_response,
-    _passthrough_error_wrapper,
+    filter_passthrough_headers,
+    fetch_passthrough_stream,
+    fetch_passthrough_response,
+    passthrough_error_wrapper,
     process_request_passthrough,
 )
+
+_filter_passthrough_headers = filter_passthrough_headers
+_fetch_passthrough_stream = fetch_passthrough_stream
+_fetch_passthrough_response = fetch_passthrough_response
+_passthrough_error_wrapper = passthrough_error_wrapper
 
 import json
 import asyncio
@@ -46,7 +51,15 @@ from core.models import (
     ModerationRequest,
     EmbeddingRequest,
 )
-from core.utils import get_engine, get_model_dict, provider_api_circular_list, truncate_for_logging, is_local_api_key
+from core.utils import (
+    get_engine,
+    get_model_dict,
+    provider_api_circular_list,
+    truncate_for_logging,
+    is_local_api_key,
+    is_valid_model_name,
+    scrub_sensitive_error_text,
+)
 from core.routing import get_right_order_providers
 from core.byok import get_byok_real_key, get_byok_template_key, is_byok_provider
 from core.error_response import openai_error_response
@@ -105,30 +118,28 @@ class LRUDict(OrderedDict):
         return default
 
 
-async def _resolve_oauth_api_key(app: "FastAPI", api_key: Optional[str], channel_id: Optional[str] = None) -> Optional[str]:
+async def resolve_oauth_api_key(app: Optional["FastAPI"], api_key: Optional[str], channel_id: Optional[str] = None) -> Optional[str]:
     """把指定渠道下的 OAuth key_id 解析成 access_token，静态 key 原样返回。"""
-    # 修改原因：oauth_state.json 已按 provider name 分层，同一个 key_id 可能在多个渠道中存在不同凭据。
-    # 修改方式：解析时要求调用方传入当前 provider['provider']，只在对应渠道下查找 key_id。
-    # 目的：保持静态 key 向后兼容，同时避免 OAuth access_token 被跨渠道误解析。
-    if not api_key or not channel_id or app is None or not hasattr(app, "state") or not hasattr(app.state, "oauth_manager"):
+    if not api_key or not channel_id or app is None:
         return api_key
-    resolved = await app.state.oauth_manager.resolve(channel_id, api_key)
+    oauth_manager = getattr(app.state, "oauth_manager", None)
+    if oauth_manager is None:
+        return api_key
+    resolved = await oauth_manager.resolve(channel_id, api_key)
     if resolved is not None:
-        # 修改原因：OAuth resolve 只返回 access_token，但部分 channel adapter 还需要 project_id、email 等非敏感字段。
-        # 修改方式：解析成功后从 OAuthManager 读取过滤后的 credential 元数据，写入当前请求上下文。
-        # 目的：提供通用元数据透传机制，让各 adapter 自行决定是否读取这些字段。
-        try:
-            from core.middleware import request_info
-            current_info = request_info.get()
-            if isinstance(current_info, dict):
-                current_info["_oauth_resolved"] = True
-                metadata = app.state.oauth_manager.get_credential_metadata(channel_id, api_key)
-                if metadata:
-                    current_info["_oauth_credential_metadata"] = metadata
-        except Exception:
-            pass
+        from core.middleware import request_info
+        current_info = request_info.get()
+        if isinstance(current_info, dict):
+            current_info["_oauth_resolved"] = True
+            metadata_getter = getattr(oauth_manager, "get_credential_metadata", None)
+            metadata = metadata_getter(channel_id, api_key) if callable(metadata_getter) else None
+            if metadata:
+                current_info["_oauth_credential_metadata"] = metadata
         return resolved
     return api_key
+
+
+_resolve_oauth_api_key = resolve_oauth_api_key
 
 
 async def _apply_final_outbound_interceptors_to_response(
@@ -236,15 +247,19 @@ async def _flush_channel_stats_batch(batch: List[tuple]) -> None:
             logger.error(f"Error updating channel stats: {str(e)}")
 
 
-def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
+def fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
     """将统计数据放入 buffer，由常驻 consumer 批量写入。"""
-    # 修改原因：每次调用都 create_task 会在 SQLite 串行写入和 database locked 重试时堆积协程。
-    # 修改方式：这里只追加轻量参数到固定长度 deque，并确保单个 consumer 负责后续写入。
-    # 目的：把后台任务数量固定为一个，极端情况下由 deque(maxlen=10000) 丢弃最旧统计兜底。
+    if _fire_and_forget_channel_stats is not _default_fire_and_forget_channel_stats:
+        _fire_and_forget_channel_stats(update_channel_stats_func, *args, **kwargs)
+        return
     _channel_stats_buffer.append((update_channel_stats_func, args, kwargs))
     _ensure_consumer_started()
     if len(_channel_stats_buffer) >= _CHANNEL_STATS_BATCH_SIZE and _channel_stats_flush_event is not None:
         _channel_stats_flush_event.set()
+
+
+_default_fire_and_forget_channel_stats = fire_and_forget_channel_stats
+_fire_and_forget_channel_stats = fire_and_forget_channel_stats
 
 
 def _ensure_consumer_started() -> None:
@@ -369,11 +384,7 @@ def _clone_request_data_for_channel_attempt(request_data: Any) -> Any:
     # 修改方式：每次 provider 尝试前优先用 Pydantic model_copy(deep=True) 深拷贝，请求对象不支持时回退到 copy.deepcopy，失败时再使用原对象。
     # 目的：让渠道入站拦截器的修改尽量局限于当前渠道尝试，避免跨渠道重试污染。
     try:
-        if hasattr(request_data, "model_copy"):
-            return request_data.model_copy(deep=True)
-        if hasattr(request_data, "copy"):
-            return request_data.copy(deep=True)
-        return copy.deepcopy(request_data)
+        return request_data.model_copy(deep=True)
     except Exception as clone_err:
         logger.debug(f"Failed to clone request_data for channel inbound attempt: {clone_err}")
         return request_data
@@ -533,7 +544,7 @@ class ModelRequestHandler:
         priority_groups: Dict[int, List[Dict[str, Any]]] = {}
         for provider in providers:
             try:
-                priority = int(provider.get("_virtual_priority", 0) or 0)
+                priority = int(provider.get("_virtual_priority") or 0)
             except (TypeError, ValueError):
                 priority = 0
             priority_groups.setdefault(priority, []).append(provider)
@@ -585,7 +596,9 @@ class ModelRequestHandler:
             响应对象
         """
         config = self.app.state.config
-        request_model_name = request_data.model
+        request_model_name = str(request_data.model or "")
+        if not is_valid_model_name(request_model_name):
+            raise HTTPException(status_code=400, detail="Invalid model name")
 
         # ── override 模式：跳过用户限速和全局路由（测试/直接调用场景） ──
         if override_providers is not None:
@@ -616,9 +629,14 @@ class ModelRequestHandler:
                     from core.middleware import request_info
                     _ri = request_info.get()
                     _client_ip = _ri.get('client_ip', '') if _ri else ''
+                    if quota_registry.is_exhausted(final_api_key):
+                        raise HTTPException(status_code=429, detail="Quota exhausted, please check your account.")
                     reject_reason = quota_registry.check(final_api_key, request_model_name, client_ip=_client_ip)
                     if reject_reason:
                         raise HTTPException(status_code=429, detail=reject_reason)
+                paid_states = getattr(self.app.state, "paid_api_keys_states", None)
+                if paid_states and safe_get(paid_states, final_api_key, "enabled", default=None) is False:
+                    raise HTTPException(status_code=429, detail="Balance is insufficient, please check your account.")
                 await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
             except HTTPException:
                 raise
@@ -636,9 +654,15 @@ class ModelRequestHandler:
             request_total_tokens = 0
             if request_data and isinstance(request_data, RequestModel):
                 for message in request_data.messages:
-                    if message.content and isinstance(message.content, str):
+                    if isinstance(message.content, str):
                         request_total_tokens += len(message.content)
+                    elif isinstance(message.content, list):
+                        for part in message.content:
+                            if part.text:
+                                request_total_tokens += len(part.text)
             request_total_tokens = int(request_total_tokens / 4)
+            if info is not None and request_total_tokens > 0:
+                info["_estimated_prompt_tokens"] = request_total_tokens
 
             matching_providers = await get_right_order_providers(
                 request_model_name, config, api_index, scheduling_algorithm, 
@@ -818,11 +842,11 @@ class ModelRequestHandler:
 
         def _get_priority_group_range(idx: int):
             """按当前候选列表取分组边界，避免渠道冷却后使用旧索引。"""
-            priority = int(matching_providers[idx].get("_virtual_priority", 0) or 0)
+            priority = int(matching_providers[idx].get("_virtual_priority") or 0)
             start, end = idx, idx + 1
-            while start > 0 and int(matching_providers[start - 1].get("_virtual_priority", 0) or 0) == priority:
+            while start > 0 and int(matching_providers[start - 1].get("_virtual_priority") or 0) == priority:
                 start -= 1
-            while end < num_matching_providers and int(matching_providers[end].get("_virtual_priority", 0) or 0) == priority:
+            while end < num_matching_providers and int(matching_providers[end].get("_virtual_priority") or 0) == priority:
                 end += 1
             return start, end
 
@@ -956,8 +980,8 @@ class ModelRequestHandler:
             # 解析流式响应头/首包超时（支持全局与单渠道/模型覆盖，默认 60s，与 keepalive_interval 解耦）
             stream_header_timeout = None
             sh_table = getattr(self.app.state, "stream_header_timeouts", None)
-            prov_prefs = safe_get(provider, "preferences", default={}) or {}
-            global_prefs = safe_get(getattr(self.app.state, "config", None), "preferences", default={}) or {}
+            prov_prefs = safe_get(provider, "preferences", default=None) or {}
+            global_prefs = safe_get(getattr(self.app.state, "config", None), "preferences", default=None) or {}
             has_explicit_sh = any(
                 isinstance(d, dict) and (d.get("stream_header_timeout") is not None or d.get("header_timeout") is not None)
                 for d in (prov_prefs, global_prefs)
@@ -1075,6 +1099,12 @@ class ModelRequestHandler:
                 else:
                     full_error = str(e)
 
+                _secret_candidates = [
+                    locals().get("current_api"),
+                    locals().get("byok_real_key"),
+                ]
+                full_error = scrub_sensitive_error_text(full_error, _secret_candidates)
+
                 retry_path.append({
                     "provider": provider_name,
                     "error": full_error[:2000],  # 增加错误信息长度限制到 2000 字符
@@ -1120,10 +1150,16 @@ class ModelRequestHandler:
                 elif isinstance(e, HTTPException):
                     status_code = e.status_code
                     # 错误解析应尽量由各渠道适配器完成，这里只做通用兜底。
-                    error_message = str(getattr(e, "detail", None) or str(e))
+                    error_message = scrub_sensitive_error_text(
+                        str(getattr(e, "detail", None) or str(e)),
+                        _secret_candidates,
+                    )
                 else:
                     status_code = 500  # Internal Server Error
-                    error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+                    error_message = scrub_sensitive_error_text(
+                        str(e) or f"Unknown error: {e.__class__.__name__}",
+                        _secret_candidates,
+                    )
                     # 修改原因：该分支此前完全静默，尝试期抛出的非 HTTP/非网络异常（如转换器
                     # RecursionError、payload 解析错误）只把 str(e) 写进 500 响应体，不落任何日志，
                     # 下游反馈 500 时无法定位是哪个渠道哪次尝试抛的什么异常。

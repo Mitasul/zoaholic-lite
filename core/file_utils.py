@@ -1,12 +1,25 @@
 import asyncio
 import base64
 import mimetypes
+import stat
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException
 
 from core.public_fetch import PublicURLTransport, UnsafeFileURL, validate_file_url
+
+
+def is_link_or_reparse(path: Path) -> bool:
+    """检测路径是否为 POSIX 符号链接或 Windows NTFS 重解析点/目录联接。"""
+    if path.is_symlink():
+        return True
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 _shared_fetch_client: Optional[httpx.AsyncClient] = None
@@ -28,14 +41,14 @@ def build_data_uri(mime_type: str, base64_data: str) -> str:
 
 
 def split_data_uri_prefix_and_data(data_uri_or_b64: str, default_mime_type: str = "image/png") -> tuple[str, str]:
-    if isinstance(data_uri_or_b64, str) and data_uri_or_b64.startswith("data:") and "," in data_uri_or_b64:
+    if data_uri_or_b64.startswith("data:") and "," in data_uri_or_b64:
         header, data = data_uri_or_b64.split(",", 1)
         return header + ",", data
     return f"data:{default_mime_type};base64,", data_uri_or_b64
 
 
 def extract_base64_data(data_uri_or_b64: str) -> str:
-    if isinstance(data_uri_or_b64, str) and data_uri_or_b64.startswith("data:"):
+    if data_uri_or_b64.startswith("data:"):
         _, data = parse_data_uri(data_uri_or_b64)
         return data
     return data_uri_or_b64

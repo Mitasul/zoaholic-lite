@@ -317,6 +317,12 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
         payload.pop("stream_options", None)
         payload.pop("presence_penalty", None)
         payload.pop("frequency_penalty", None)
+    elif payload.get("stream") is True:
+        existing_stream_opts = payload.get("stream_options")
+        if isinstance(existing_stream_opts, dict):
+            payload["stream_options"] = {**existing_stream_opts, "include_usage": True}
+        else:
+            payload["stream_options"] = {"include_usage": True}
 
     # 修改原因：temperature 删除、默认 temperature 和 Responses 专属字段都不应由通用渠道按模型名或 URL 决定。
     # 修改方式：删除这些硬编码分支，保留请求、上游和插件已经确定的 payload。

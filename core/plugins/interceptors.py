@@ -395,11 +395,9 @@ class InterceptorRegistry:
             return True
         return False
     
-    def get_inbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_inbound_interceptors(self) -> List[InterceptorEntry]:
         """获取所有入站拦截器（按优先级排序）"""
-        interceptors = list(self._inbound_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._inbound_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
     
@@ -425,7 +423,7 @@ class InterceptorRegistry:
         Returns:
             经过所有拦截器处理后的 request_data
         """
-        interceptors = self.get_inbound_interceptors(enabled_only=True)
+        interceptors = self.get_inbound_interceptors()
         
         enabled_plugin_names = None
         if enabled_plugins is not None:
@@ -494,11 +492,9 @@ class InterceptorRegistry:
             return True
         return False
 
-    def get_channel_inbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_channel_inbound_interceptors(self) -> List[InterceptorEntry]:
         """获取所有渠道入站拦截器（按优先级排序）"""
-        interceptors = list(self._channel_inbound_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._channel_inbound_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
 
@@ -515,7 +511,7 @@ class InterceptorRegistry:
 
         enabled_plugins 来自 provider.preferences.enabled_plugins。
         """
-        interceptors = self.get_channel_inbound_interceptors(enabled_only=True)
+        interceptors = self.get_channel_inbound_interceptors()
         token = _current_enabled_plugins.set(enabled_plugins)
 
         # 修改原因：渠道入站阶段和请求拦截阶段使用相同 enabled_plugins 过滤规则。
@@ -600,11 +596,9 @@ class InterceptorRegistry:
             return True
         return False
     
-    def get_request_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_request_interceptors(self) -> List[InterceptorEntry]:
         """获取所有请求拦截器（按优先级排序）"""
-        interceptors = list(self._request_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._request_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
     
@@ -641,7 +635,7 @@ class InterceptorRegistry:
         Returns:
             (url, headers, payload) 经过所有拦截器处理后的结果
         """
-        interceptors = self.get_request_interceptors(enabled_only=True)
+        interceptors = self.get_request_interceptors()
         
         # 解析 enabled_plugins，提取插件名（忽略参数部分用于过滤）
         enabled_plugin_names = None
@@ -722,11 +716,9 @@ class InterceptorRegistry:
             return True
         return False
     
-    def get_response_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_response_interceptors(self) -> List[InterceptorEntry]:
         """获取所有响应拦截器（按优先级排序）"""
-        interceptors = list(self._response_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._response_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
     
@@ -757,7 +749,7 @@ class InterceptorRegistry:
         Returns:
             经过所有拦截器处理后的响应数据
         """
-        interceptors = self.get_response_interceptors(enabled_only=True)
+        interceptors = self.get_response_interceptors()
         
         # 将 enabled_plugins 写入 ContextVar，供回调通过 get_current_plugin_options() 读取
         token = _current_enabled_plugins.set(enabled_plugins)
@@ -833,11 +825,9 @@ class InterceptorRegistry:
             return True
         return False
 
-    def get_channel_outbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_channel_outbound_interceptors(self) -> List[InterceptorEntry]:
         """获取所有渠道出站拦截器（按优先级排序）"""
-        interceptors = list(self._channel_outbound_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._channel_outbound_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
 
@@ -855,7 +845,7 @@ class InterceptorRegistry:
 
         enabled_plugins 来自 provider.preferences.enabled_plugins。
         """
-        interceptors = self.get_channel_outbound_interceptors(enabled_only=True)
+        interceptors = self.get_channel_outbound_interceptors()
         token = _current_enabled_plugins.set(enabled_plugins)
         enabled_plugin_names = None
         if enabled_plugins is not None:
@@ -924,11 +914,9 @@ class InterceptorRegistry:
             return True
         return False
 
-    def get_key_outbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_key_outbound_interceptors(self) -> List[InterceptorEntry]:
         """获取所有 Key 出站拦截器（按优先级排序）"""
-        interceptors = list(self._key_outbound_interceptors.values())
-        if enabled_only:
-            interceptors = [i for i in interceptors if i.enabled]
+        interceptors = [i for i in self._key_outbound_interceptors.values() if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
 
@@ -946,7 +934,7 @@ class InterceptorRegistry:
 
         enabled_plugins 来自 api_keys[].preferences.enabled_plugins。
         """
-        interceptors = self.get_key_outbound_interceptors(enabled_only=True)
+        interceptors = self.get_key_outbound_interceptors()
         token = _current_enabled_plugins.set(enabled_plugins)
         enabled_plugin_names = None
         if enabled_plugins is not None:
@@ -1023,17 +1011,15 @@ class InterceptorRegistry:
             return True
         return False
     
-    def get_balance_enrichers(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+    def get_balance_enrichers(self) -> List[InterceptorEntry]:
         """获取所有余额补充器（按优先级排序）"""
-        enrichers = list(self._balance_enrichers.values())
-        if enabled_only:
-            enrichers = [i for i in enrichers if i.enabled]
+        enrichers = [i for i in self._balance_enrichers.values() if i.enabled]
         enrichers.sort(key=lambda i: i.priority)
         return enrichers
     
     async def apply_balance_enrichers(
         self,
-        result: Dict[str, Any],
+        result: Optional[Dict[str, Any]],
         engine: str,
         provider: Dict[str, Any],
         enabled_plugins: Optional[List[str]] = None,
@@ -1056,7 +1042,7 @@ class InterceptorRegistry:
         Returns:
             经过所有补充器处理后的余额结果字典
         """
-        enrichers = self.get_balance_enrichers(enabled_only=True)
+        enrichers = self.get_balance_enrichers()
         if result is None:
             result = {}
         
@@ -1088,36 +1074,6 @@ class InterceptorRegistry:
             _current_enabled_plugins.reset(token)
         
         return result
-    
-    # ==================== 启用/禁用 ====================
-    
-    def enable_request_interceptor(self, interceptor_id: str) -> bool:
-        """启用请求拦截器"""
-        if interceptor_id in self._request_interceptors:
-            self._request_interceptors[interceptor_id].enabled = True
-            return True
-        return False
-    
-    def disable_request_interceptor(self, interceptor_id: str) -> bool:
-        """禁用请求拦截器"""
-        if interceptor_id in self._request_interceptors:
-            self._request_interceptors[interceptor_id].enabled = False
-            return True
-        return False
-    
-    def enable_response_interceptor(self, interceptor_id: str) -> bool:
-        """启用响应拦截器"""
-        if interceptor_id in self._response_interceptors:
-            self._response_interceptors[interceptor_id].enabled = True
-            return True
-        return False
-    
-    def disable_response_interceptor(self, interceptor_id: str) -> bool:
-        """禁用响应拦截器"""
-        if interceptor_id in self._response_interceptors:
-            self._response_interceptors[interceptor_id].enabled = False
-            return True
-        return False
     
     # ==================== 按插件注销 ====================
     

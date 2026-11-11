@@ -62,10 +62,6 @@ class PluginRegistry:
         """列出所有扩展点"""
         return list(self._extension_points.values())
     
-    def has_extension_point(self, name: str) -> bool:
-        """检查扩展点是否存在"""
-        return name in self._extension_points
-    
     # ==================== 扩展管理 ====================
     
     def register_extension(
@@ -251,19 +247,6 @@ class PluginRegistry:
             return True
         return False
     
-    def set_extension_priority(
-        self,
-        extension_point: str,
-        extension_id: str,
-        priority: int
-    ) -> bool:
-        """设置扩展优先级"""
-        ext = self.get_extension(extension_point, extension_id)
-        if ext:
-            ext.priority = priority
-            return True
-        return False
-    
     # ==================== 辅助方法 ====================
     
     def _validate_implementation(self, ep: ExtensionPoint, impl: Any) -> None:
@@ -304,9 +287,3 @@ def get_registry() -> PluginRegistry:
     if _global_registry is None:
         _global_registry = PluginRegistry()
     return _global_registry
-
-
-def reset_registry() -> None:
-    """重置全局注册表（主要用于测试）"""
-    global _global_registry
-    _global_registry = None

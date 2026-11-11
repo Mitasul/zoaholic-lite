@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ipaddress import ip_address, ip_network, _BaseAddress, _BaseNetwork
-from typing import Iterable, Any
+from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address, ip_network
+from typing import Any, Iterable, Union
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 
+IPAddress = Union[IPv4Address, IPv6Address]
+IPNetwork = Union[IPv4Network, IPv6Network]
 IP_BLOCKED_MESSAGE = "Your IP has been blocked. Please contact the administrator."
 IP_BLOCKED_TYPE = "ip_blocked"
 
@@ -18,8 +20,8 @@ IP_BLOCKED_TYPE = "ip_blocked"
 class ParsedIPBlacklist:
     """预解析后的 IP 黑名单，精确 IP 用 set，CIDR 网段用 list。"""
 
-    exact: frozenset[_BaseAddress]
-    networks: tuple[_BaseNetwork, ...]
+    exact: frozenset[IPAddress]
+    networks: tuple[IPNetwork, ...]
 
 
 def _coerce_blacklist_items(raw_entries: Any) -> list[str]:
@@ -151,6 +153,23 @@ def get_client_ip_from_request_info(default: str | None = None) -> str | None:
         return str(client_ip).strip() if client_ip else default
     except Exception:
         return default
+
+
+def extract_client_ip(headers: Any, fallback_host: str | None = None) -> str:
+    """统一从请求头提取真实客户端 IP（CF-Connecting-IP > X-Forwarded-For 最右跳 > X-Real-IP > fallback）。"""
+    if headers is not None:
+        cf_ip = (headers.get("cf-connecting-ip") or "").strip()
+        if cf_ip:
+            return cf_ip
+        forwarded_for = headers.get("x-forwarded-for")
+        if forwarded_for:
+            hops = [part.strip() for part in str(forwarded_for).split(",") if part.strip()]
+            if hops:
+                return hops[-1]
+        real_ip = (headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+    return fallback_host or "unknown"
 
 
 def is_global_ip_blocked(app: Any, client_ip: str | None) -> bool:

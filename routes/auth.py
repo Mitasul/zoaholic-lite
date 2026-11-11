@@ -7,6 +7,8 @@
 - API 网关的用户侧依旧支持 API Key。
 """
 
+from collections import deque
+from time import monotonic
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -14,13 +16,57 @@ from pydantic import BaseModel, Field
 
 from core.jwt_utils import issue_jwt, decode_jwt
 from core.initialization import ensure_initialized, get_admin_user
-from core.auth import verify_admin_api_key
+from core.auth import select_admin_api_key, verify_admin_api_key
+from core.ip_blacklist import extract_client_ip
 from core.security import verify_password
 from routes.deps import rate_limit_dependency, get_app
 from db import DISABLE_DATABASE
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+MAX_LOGIN_FAILURES = 6
+LOGIN_LOCKOUT_WINDOW_SECONDS = 600.0
+_LOGIN_FAILURES: dict[str, deque[float]] = {}
+_select_admin_api_key_from_config = select_admin_api_key
+
+
+def _extract_login_client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return "unknown"
+    client = getattr(request, "client", None)
+    return extract_client_ip(getattr(request, "headers", None), getattr(client, "host", None) or "unknown")
+
+
+def _check_login_lockout(client_ip: str) -> None:
+    now = monotonic()
+    bucket = _LOGIN_FAILURES.get(client_ip)
+    if not bucket:
+        return
+    cutoff = now - LOGIN_LOCKOUT_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    if not bucket:
+        _LOGIN_FAILURES.pop(client_ip, None)
+        return
+    if len(bucket) >= MAX_LOGIN_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Please try again later.",
+        )
+
+
+def _record_login_failure(client_ip: str) -> None:
+    now = monotonic()
+    bucket = _LOGIN_FAILURES.setdefault(client_ip, deque())
+    cutoff = now - LOGIN_LOCKOUT_WINDOW_SECONDS
+    while bucket and bucket[0] < cutoff:
+        bucket.popleft()
+    bucket.append(now)
+
+
+def _clear_login_failures(client_ip: str) -> None:
+    _LOGIN_FAILURES.pop(client_ip, None)
 
 
 class LoginRequest(BaseModel):
@@ -42,29 +88,13 @@ class MeResponse(BaseModel):
     admin_api_key: Optional[str] = None
 
 
-def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
-    api_keys = conf.get("api_keys") or []
-    if not isinstance(api_keys, list):
-        return None
-
-    for item in api_keys:
-        if not isinstance(item, dict):
-            continue
-        if "admin" in str(item.get("role", "")):
-            key = item.get("api")
-            if key:
-                return str(key)
-
-    if api_keys and isinstance(api_keys[0], dict) and api_keys[0].get("api"):
-        return str(api_keys[0]["api"])
-
-    return None
-
-
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(rate_limit_dependency)])
-async def login(payload: LoginRequest = Body(...)):
+async def login(request: Request = None, payload: LoginRequest = Body(...)):
     if DISABLE_DATABASE:
         raise HTTPException(status_code=500, detail="Database is disabled; cannot login.")
+
+    client_ip = _extract_login_client_ip(request)
+    _check_login_lockout(client_ip)
 
     await ensure_initialized(get_app())
     admin_user = await get_admin_user()
@@ -73,11 +103,14 @@ async def login(payload: LoginRequest = Body(...)):
         raise HTTPException(status_code=404, detail="Admin user not initialized. Please visit /setup.")
 
     if admin_user.username != payload.username:
+        _record_login_failure(client_ip)
         raise HTTPException(status_code=403, detail="Invalid username or password")
 
     if not verify_password(payload.password, admin_user.password_hash):
+        _record_login_failure(client_ip)
         raise HTTPException(status_code=403, detail="Invalid username or password")
 
+    _clear_login_failures(client_ip)
     token = issue_jwt({"sub": admin_user.username, "role": "admin"})
 
     # admin_api_key 仅用于前端展示/兼容旧鉴权；配置权威来自 api.yaml（app.state.config）

@@ -959,7 +959,7 @@ _VERTEX_STRIP_BETA_PREFIXES = (
 )
 
 
-def filter_vertex_claude_beta_header(raw_beta: str) -> str:
+def filter_vertex_claude_beta_header(raw_beta: str | None) -> str:
     """剥离发往 Vertex AI 的 anthropic-beta 中的私有/OAuth 标识，其余特性原样保留由客户端自行回退。"""
     if not raw_beta or not isinstance(raw_beta, str):
         return ""
@@ -973,8 +973,6 @@ def filter_vertex_claude_beta_header(raw_beta: str) -> str:
 
 def _normalize_vertex_claude_payload_in_place(payload: dict, original_model: str, *, is_stream: bool) -> dict:
     """清理并规范化发往 Vertex Claude 的请求体（兼容透传与转换模式）。"""
-    if not isinstance(payload, dict):
-        return payload
     inbound_ver = str(payload.pop("_inbound_anthropic_version", None) or "").strip()
     if inbound_ver:
         payload["anthropic_version"] = "vertex-2023-10-16" if inbound_ver == "2023-06-01" else inbound_ver
@@ -1417,7 +1415,7 @@ async def patch_passthrough_vertex_gemini_payload(
     """透传模式下对发往 Vertex Gemini 的 payload 做修饰，并自动补齐缺失的 contents[].role。"""
     from .gemini_channel import patch_passthrough_gemini_payload
     payload = await patch_passthrough_gemini_payload(payload, modifications, request, engine, provider, api_key)
-    if isinstance(payload, dict) and isinstance(payload.get("contents"), list):
+    if isinstance(payload.get("contents"), list):
         for item in payload["contents"]:
             if isinstance(item, dict) and not item.get("role"):
                 item["role"] = "user"

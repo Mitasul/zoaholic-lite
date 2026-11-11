@@ -188,10 +188,7 @@ class _QuotaCapturingStreamContext:
 
     async def __aenter__(self):
         response = await self._inner_context.__aenter__()
-        # 修改原因：fetch_gpt_response_stream 在内部持有 httpx response，外层 wrapper 只能包住 stream context 才能拿到 headers。
-        # 修改方式：在 __aenter__ 返回原 response 前采集 ratelimit headers，不影响后续 OpenAI adapter 读取 body。
-        # 目的：在不修改 openai_channel.py 的前提下完成 Codex 被动额度采集。
-        _store_quota_from_headers(getattr(response, "headers", None))
+        _store_quota_from_headers(response.headers)
         return response
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -209,10 +206,7 @@ class _QuotaCapturingClient:
 
     async def post(self, *args, **kwargs):
         response = await self._client.post(*args, **kwargs)
-        # 修改原因：非流式 OpenAI adapter 直接调用 client.post，只有代理 client 能在不复制解析逻辑的情况下看到 response。
-        # 修改方式：post 返回前采集 headers，然后把原 response 原样交给 fetch_openai_response。
-        # 目的：复用 OpenAI 非流式解析，同时增加 Codex quota 被动缓存。
-        _store_quota_from_headers(getattr(response, "headers", None))
+        _store_quota_from_headers(response.headers)
         return response
 
     def stream(self, *args, **kwargs):
@@ -456,13 +450,6 @@ class CodexProvider(OAuthProvider):
         """返回 Codex API 默认上游地址。"""
         return DEFAULT_BASE_URL
 
-    def _parse_ratelimit_headers(self, headers) -> dict | None:
-        """把 OpenAI ratelimit 响应头转换为前端展示的 quota 结构。"""
-        # 修改原因：主动查询和被动 wrapper 都要用同一套响应头解析规则，避免两个路径展示不一致。
-        # 修改方式：CodexProvider 方法委托给模块级 _parse_ratelimit_headers，供测试和 wrapper 共用。
-        # 目的：让 quota_inner、quota_outer 与 raw 字段在所有采集路径中保持稳定。
-        return _parse_ratelimit_headers(headers)
-
     async def fetch_quota(self, credential: dict, config: dict | None = None) -> dict | None:
         """发一个轻量 Responses API 请求，从响应头读取 Codex quota 信息。"""
         access_token = credential.get("access_token")
@@ -493,7 +480,7 @@ class CodexProvider(OAuthProvider):
         except Exception:
             return None
 
-        return self._parse_ratelimit_headers(response.headers)
+        return _parse_ratelimit_headers(response.headers)
 
     async def _post_token(self, data: dict, config: dict | None = None) -> dict:
         """向 OpenAI OAuth token endpoint 提交 form 请求。"""

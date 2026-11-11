@@ -536,22 +536,16 @@ def _build_key_analytics_time_range(
 
 
 def _safe_int(value: Any) -> int:
-    """把数据库聚合值安全转成 int。
-
-    修改原因：SQLite、D1 和不同驱动可能把 COUNT/SUM 返回为 int、float、Decimal 或字符串。
-    修改方式：统一空值归零，再尝试 int(float(value))。
-    目的：让接口返回类型稳定，不受数据库驱动影响。
-    """
-
-    if value is None:
+    """把数据库聚合值安全转成 int（使用 Decimal 避免 float 精度损失）。"""
+    if value is None or isinstance(value, bool):
         return 0
+    if isinstance(value, int):
+        return value
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return 0
+        from decimal import Decimal
+        return int(Decimal(str(value)))
+    except Exception:
+        return 0
 
 
 def _safe_float(value: Any) -> float:
@@ -1248,7 +1242,7 @@ async def get_key_analytics_ip_detail(
         key=lambda value: _stringify_datetime(value) or "",
         default=None,
     )
-    request_app = getattr(request, "app", None)
+    request_app = request.scope.get("app") if request is not None else None
     quota_registry = getattr(request_app.state, "quota_registry", None) if request_app is not None else None
     quota_rules = quota_registry.get_ip_quota_breakdown(matched_api_key, ip) if quota_registry else []
 
@@ -1801,7 +1795,7 @@ async def get_model_trend(
         if h not in tokens_chart_dict:
             tokens_chart_dict[h] = {"hour": h}
         chart_dict[h][m] = item['count']
-        tokens_chart_dict[h][m] = item.get('tokens', 0) or 0
+        tokens_chart_dict[h][m] = item.get('tokens') or 0
 
     chart_data = sorted(chart_dict.values(), key=lambda x: x['hour'])
     tokens_chart_data = sorted(tokens_chart_dict.values(), key=lambda x: x['hour'])
@@ -1812,9 +1806,9 @@ async def get_model_trend(
         h = item['hour']
         if h not in token_breakdown:
             token_breakdown[h] = {"hour": h, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
-        token_breakdown[h]["prompt_tokens"] += item.get("prompt_tokens", 0) or 0
-        token_breakdown[h]["completion_tokens"] += item.get("completion_tokens", 0) or 0
-        token_breakdown[h]["cached_tokens"] += item.get("cached_tokens", 0) or 0
+        token_breakdown[h]["prompt_tokens"] += item.get("prompt_tokens") or 0
+        token_breakdown[h]["completion_tokens"] += item.get("completion_tokens") or 0
+        token_breakdown[h]["cached_tokens"] += item.get("cached_tokens") or 0
     token_breakdown_data = sorted(token_breakdown.values(), key=lambda x: x['hour'])
 
     return JSONResponse(content={
@@ -2093,7 +2087,7 @@ async def add_credits_to_api_key(
     from copy import deepcopy
     from core.key_hierarchy import raw_key_config
     from core.stats import update_paid_api_keys_states
-    from routes.admin import _persist_config
+    from routes.admin import persist_config
 
     app = get_app()
     if paid_key not in app.state.paid_api_keys_states:
@@ -2106,7 +2100,7 @@ async def add_credits_to_api_key(
     if not prefs.get('created_at'):
         prefs['created_at'] = app.state.paid_api_keys_states[paid_key].get('created_at') or datetime.now(timezone.utc)
     candidate['api_keys'][key_index] = raw
-    await _persist_config(app, sections_to_verify=['api_keys'], candidate_config=candidate)
+    await persist_config(app, sections_to_verify=['api_keys'], candidate_config=candidate)
     await update_paid_api_keys_states(app, paid_key)
     state = app.state.paid_api_keys_states[paid_key]
     return JSONResponse(content={
@@ -2774,7 +2768,7 @@ async def get_dashboard_overview(
     if DISABLE_DATABASE:
         return JSONResponse(content={"empty": True})
 
-    app = request.app if request is not None else get_app()
+    app = request.app
     now_utc = datetime.now(timezone.utc)
     local_offset = timedelta(minutes=-tz_offset_minutes)
     local_tz = timezone(local_offset)

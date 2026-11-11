@@ -179,16 +179,11 @@ _OAUTH_PROVIDER_REGISTRAR: Optional[Callable[[str, Any], None]] = None
 
 def set_oauth_provider_registrar(
     registrar: Optional[Callable[[str, Any], None]],
-    *,
-    replay_existing: bool = False,
 ) -> None:
     """设置运行时 OAuth provider 注册回调。"""
     global _OAUTH_PROVIDER_REGISTRAR
     _OAUTH_PROVIDER_REGISTRAR = registrar
-    # 修改原因：OAuthManager 可能在部分渠道已经注册后才初始化，不能只处理后续新增渠道。
-    # 修改方式：调用方传 replay_existing=True 时遍历当前注册表，并复用统一的安全注册函数。
-    # 目的：保证启动顺序不影响 OAuth provider 自动注册结果。
-    if replay_existing and registrar is not None:
+    if registrar is not None:
         for channel_id, channel_def in list(_REGISTRY.items()):
             _register_oauth_provider_if_possible(channel_id, channel_def.oauth_provider)
 

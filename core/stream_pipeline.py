@@ -8,7 +8,7 @@
 import asyncio
 import json
 import time as time_module
-from typing import Optional
+from typing import Any, Optional
 
 import h2.exceptions
 import httpx
@@ -373,7 +373,7 @@ async def error_handling_wrapper(
                 if iterator is not generator:
                     await close_async_iterator(generator)
 
-    def _extract_first_json_candidate(text: str) -> Optional[str]:
+    def _extract_first_json_candidate(text: Any) -> Optional[str]:
         """
         从首个 chunk 中提取可用于 json.loads 的字符串。
 

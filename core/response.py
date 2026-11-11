@@ -283,7 +283,7 @@ def _save_upstream_response_for_non_stream(response):
         logger.error(f"Error saving upstream response for non-stream: {str(e)}")
 
 
-def _log_upstream_request(url, payload):
+def log_upstream_request(url, payload):
     """在 fetch 层记录实际发给上游的请求体（force_stream 等插件修改后的真实值）"""
     try:
         info = request_info.get()
@@ -296,7 +296,10 @@ def _log_upstream_request(url, payload):
         logger.error(f"Error logging upstream request in fetch layer: {e}")
 
 
-async def _apply_response_path_interceptors(
+_log_upstream_request = log_upstream_request
+
+
+async def apply_response_path_interceptors(
     response_chunk: Any,
     engine: str,
     model: str,
@@ -338,6 +341,9 @@ async def _apply_response_path_interceptors(
         response_chunk, engine, model, api_key_info or {}, is_stream=is_stream, enabled_plugins=key_enabled_plugins
     )
     return response_chunk
+
+
+_apply_response_path_interceptors = apply_response_path_interceptors
 
 
 async def fetch_response(

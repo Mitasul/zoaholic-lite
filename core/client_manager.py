@@ -107,6 +107,7 @@ class ClientManager:
                     )
 
                     client_config = {
+                        "follow_redirects": False,
                         **self.default_config,
                         "timeout": timeout,
                         "limits": limits,

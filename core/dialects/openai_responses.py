@@ -573,7 +573,7 @@ async def render_responses_response(
     return response
 
 
-async def render_responses_stream(canonical_sse_chunk: str) -> str:
+async def render_responses_stream(canonical_sse_chunk: Any) -> Any:
     """
     将 Canonical SSE 流转换为 Responses API 流格式
 

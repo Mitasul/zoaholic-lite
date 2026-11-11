@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.log_config import logger
-from core.auth import _extract_token, authenticate_admin_api_key_token
+from core.auth import authenticate_admin_api_key_token, extract_token, select_admin_api_key
 from core.initialization import ensure_initialized, get_admin_user, refresh_initialization
 from core.security import hash_password, verify_password
 from routes.deps import get_app
@@ -103,24 +103,7 @@ def _generate_admin_api_key() -> str:
     return "zk-" + secrets.token_urlsafe(36)
 
 
-def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
-    api_keys = conf.get("api_keys") or []
-    if not isinstance(api_keys, list):
-        return None
-
-    for item in api_keys:
-        if not isinstance(item, dict):
-            continue
-        if "admin" in str(item.get("role", "")):
-            key = item.get("api")
-            if key:
-                return str(key)
-
-    # fallback：第一把 key
-    if api_keys and isinstance(api_keys[0], dict) and api_keys[0].get("api"):
-        return str(api_keys[0]["api"])
-
-    return None
+_select_admin_api_key_from_config = select_admin_api_key
 
 
 @router.get("/status", response_model=SetupStatus)
@@ -180,7 +163,7 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
     if has_config and admin_user is not None:
         raise HTTPException(status_code=409, detail="Already initialized")
     if has_config:
-        token = await _extract_token(request, None)
+        token = await extract_token(request, None)
         from core.middleware import StatsMiddleware
         client_ip = StatsMiddleware._get_client_ip(request.scope, request.scope.get("headers", []))
         authenticate_admin_api_key_token(app, token, client_ip, require_explicit_role=True)

@@ -14,7 +14,7 @@ from .utils import (
 from .plugins.interceptors import apply_request_interceptors
 
 
-def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> RequestModel:
+def _prepend_system_prompt(request: RequestModel, system_prompt: str | None) -> RequestModel:
     """
     将渠道配置的系统提示词追加到请求消息的最前面
     
@@ -25,10 +25,10 @@ def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> Request
     Returns:
         RequestModel: 修改后的请求模型（如果有系统提示词则追加，否则返回原请求）
     """
-    if system_prompt is None:
+    if not system_prompt:
         return request
 
-    system_prompt_text = system_prompt if isinstance(system_prompt, str) else str(system_prompt)
+    system_prompt_text = str(system_prompt)
     if not system_prompt_text.strip():
         return request
     
@@ -48,7 +48,7 @@ def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> Request
                     # 如果是列表格式，在第一个文本项前追加
                     new_content = list(msg.content)  # 复制列表
                     for i, item in enumerate(new_content):
-                        if hasattr(item, 'type') and item.type == "text" and item.text:
+                        if item.type == "text" and item.text:
                             from .models import ContentItem
                             new_content[i] = ContentItem(
                                 type="text",
@@ -76,7 +76,7 @@ def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> Request
         
         # 创建新的请求对象
         request_dict = request.model_dump(exclude={'messages'})
-        request_dict['messages'] = [m.model_dump() if hasattr(m, 'model_dump') else m for m in new_messages]
+        request_dict['messages'] = [m.model_dump() for m in new_messages]
         return RequestModel(**request_dict)
     else:
         # 如果没有 system 消息，在消息列表开头插入一个新的 system 消息
@@ -85,7 +85,7 @@ def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> Request
         
         # 创建新的请求对象
         request_dict = request.model_dump(exclude={'messages'})
-        request_dict['messages'] = [m.model_dump() if hasattr(m, 'model_dump') else m for m in new_messages]
+        request_dict['messages'] = [m.model_dump() for m in new_messages]
         return RequestModel(**request_dict)
 
 

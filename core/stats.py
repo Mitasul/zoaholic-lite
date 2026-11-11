@@ -692,13 +692,8 @@ def _unpack_model_prices(price_result) -> tuple[float, float, float]:
 
 
 def _apply_cached_prompt_price(current_info: dict, prompt_price: float, cached_price: float) -> None:
-    """
-    修改原因：数据库没有单独的 cached_price 字段，不能通过表结构保存缓存输入价。
-    修改方式：按 cached_tokens 对 prompt_price 做加权折算，再覆盖 current_info["prompt_price"]。
-    目的：沿用现有成本公式，同时让缓存命中 token 按缓存价格计费。
-    """
-    cached_tokens = current_info.get("cached_tokens", 0) or 0
-    prompt_tokens = current_info.get("prompt_tokens", 0) or 0
+    cached_tokens = current_info.get("cached_tokens") or 0
+    prompt_tokens = current_info.get("prompt_tokens") or 0
     if cached_tokens > 0 and prompt_tokens > 0 and cached_price != prompt_price:
         # clamp: 防止异常情况 cached_tokens > prompt_tokens
         billable_cached = min(cached_tokens, prompt_tokens)
@@ -766,15 +761,15 @@ def _record_quota_usage_from_info(current_info: dict, app, check_key: str) -> No
     if not quota_registry or not check_key:
         return
 
-    tokens_in = current_info.get('prompt_tokens', 0) or 0
-    tokens_out = current_info.get('completion_tokens', 0) or 0
-    total_tokens = current_info.get('total_tokens', 0) or (tokens_in + tokens_out)
+    tokens_in = current_info.get('prompt_tokens') or 0
+    tokens_out = current_info.get('completion_tokens') or 0
+    total_tokens = current_info.get('total_tokens') or (tokens_in + tokens_out)
     cost = (
-        tokens_in * (current_info.get('prompt_price', 0) or 0) +
-        tokens_out * (current_info.get('completion_price', 0) or 0)
+        tokens_in * (current_info.get('prompt_price') or 0) +
+        tokens_out * (current_info.get('completion_price') or 0)
     ) / 1_000_000
-    model = current_info.get('model', 'default') or 'default'
-    client_ip = current_info.get('client_ip', '') or ''
+    model = current_info.get('model') or 'default'
+    client_ip = current_info.get('client_ip') or ''
     if cost > 0 or total_tokens > 0 or tokens_in > 0 or tokens_out > 0:
         quota_registry.record_usage(
             check_key,

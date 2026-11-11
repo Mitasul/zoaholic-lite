@@ -82,16 +82,6 @@ class PluginManager:
     
     # ==================== 钩子管理 ====================
     
-    def add_hook(self, hook_name: str, callback: Callable) -> None:
-        """添加钩子回调"""
-        if hook_name in self._hooks:
-            self._hooks[hook_name].append(callback)
-    
-    def remove_hook(self, hook_name: str, callback: Callable) -> None:
-        """移除钩子回调"""
-        if hook_name in self._hooks and callback in self._hooks[hook_name]:
-            self._hooks[hook_name].remove(callback)
-    
     def _trigger_hook(self, hook_name: str, *args, **kwargs) -> None:
         """触发钩子"""
         for callback in self._hooks.get(hook_name, []):
@@ -309,20 +299,6 @@ class PluginManager:
         """禁用扩展"""
         return self._registry.disable_extension(extension_point, extension_id)
     
-    # ==================== 便捷方法 ====================
-    
-    def get_channel_extensions(self) -> List[Extension]:
-        """获取所有渠道扩展"""
-        return self.get_extensions(ExtensionPointType.CHANNELS.value)
-    
-    def get_middleware_extensions(self) -> List[Extension]:
-        """获取所有中间件扩展"""
-        return self.get_extensions(ExtensionPointType.MIDDLEWARES.value)
-    
-    def get_hook_extensions(self) -> List[Extension]:
-        """获取所有钩子扩展"""
-        return self.get_extensions(ExtensionPointType.HOOKS.value)
-    
     # ==================== 状态查询 ====================
     
     def get_status(self) -> Dict[str, Any]:
@@ -337,10 +313,6 @@ class PluginManager:
             "loader": self._loader.get_status(),
             "registry": self._registry.get_stats(),
         }
-    
-    def is_initialized(self) -> bool:
-        """检查是否已初始化"""
-        return self._initialized
 
 
 # 全局插件管理器实例
@@ -372,9 +344,3 @@ def init_plugin_manager(
     global _plugin_manager
     _plugin_manager = PluginManager(plugin_dirs, auto_load)
     return _plugin_manager
-
-
-def reset_plugin_manager() -> None:
-    """重置全局插件管理器（主要用于测试）"""
-    global _plugin_manager
-    _plugin_manager = None

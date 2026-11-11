@@ -75,7 +75,7 @@ _RT_DISABLED_FILE = _os.path.join(
 _rt_save_lock = _threading.Lock()
 
 
-def _save_all_auto_disabled():
+def save_all_auto_disabled():
     """将所有渠道的运行时自动禁用状态持久化到 JSON 文件。"""
     try:
         snapshot = {}
@@ -99,6 +99,9 @@ def _save_all_auto_disabled():
             _os.replace(tmp, _RT_DISABLED_FILE)
     except Exception as e:
         logger.debug(f"[auto_disable_persist] save failed: {e}")
+
+
+_save_all_auto_disabled = save_all_auto_disabled
 
 
 def load_auto_disabled_snapshot() -> dict:
@@ -224,30 +227,13 @@ class ThreadSafeCircularList:
         # 目的：保持全局 key pool 单例稳定，并让依赖方向回到 core 内部业务模块。
         from core.key_stats import get_sorted_api_keys
         try:
-            sorted_keys = await get_sorted_api_keys(self.provider_name, self.original_items, group_size=100)
+            sorted_keys = await get_sorted_api_keys(self.provider_name, self.original_items)
             if sorted_keys:
                 await self.reset_items(sorted_keys)
         except Exception as e:
             logger.error(f"Error during key reordering for provider '{self.provider_name}': {e}")
 
-    async def set_cooling(self, item: str, cooling_time: int = 60):
-        """设置某个 item 进入冷却状态
-
-        Args:
-            item: 需要冷却的 item
-            cooling_time: 冷却时间(秒)，默认60秒
-        """
-        if item is None:
-            return
-        now = time()
-        async with self.lock:
-            self.cooling_until[item] = now + cooling_time
-            # 修改原因：requests 的值已经是按 model 分组的 deque，不能再按旧 list 结构直接替换。
-            # 修改方式：冷却时只设置 cooling_until，不主动改写 requests 结构，交给窗口清理和过期清理处理。
-            # 目的：避免把 requests[item] 误改成 list，保持嵌套 deque 结构一致。
-            logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
-
-    async def set_auto_disabled(self, item: str, duration: int = 0, reason: str = ""):
+    async def set_auto_disabled(self, item: str | None, duration: int = 0, reason: str = ""):
         """自动禁用某个 Key。
 
         通过设置 cooling_until 实现，复用现有的 is_rate_limited 判断链路。

@@ -9,6 +9,7 @@ import json
 import copy
 import asyncio
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 from ..models import Message, ImageGenerationRequest
@@ -35,10 +36,13 @@ from urllib.parse import urlparse
 # Gemini 工具函数
 # ============================================================
 
-def _is_image_model(model_name: str) -> bool:
+def is_image_model(model_name: str) -> bool:
     """判断模型是否为图片生成模型（基于模型名约定）"""
     name = model_name.lower()
     return "-image" in name or "image-generation" in name
+
+
+_is_image_model = is_image_model
 
 
 # ============================================================
@@ -502,82 +506,83 @@ def normalize_gemini_payload(payload: dict) -> dict:
 
 
 async def patch_passthrough_gemini_payload(
-    payload: dict,
-    modifications: dict,
+    payload: Any,
+    modifications: dict | None,
     request,
     engine: str,
     provider: dict,
     api_key=None,
-) -> dict:
+) -> Any:
     """透传模式下对 Gemini native payload 做渠道级修饰（system_prompt 注入 + trailing model 兜底 + AIS/Vertex safetySettings 对齐）。"""
-    if isinstance(payload, dict):
-        is_vertex = _is_vertex_provider(engine, provider)
-        contents = payload.get("contents")
-        if isinstance(contents, list):
-            if not is_vertex:
-                # AIS 渠道 (generativelanguage.googleapis.com) 的 contents 仅允许 role 为 user/model，
-                # 严禁出现 role="system"（如客户端针对 Vertex 追加的尾部空 system 块）。
-                cleaned_contents = []
-                for _m in contents:
-                    if isinstance(_m, dict) and _m.get("role") == "system":
-                        _pts = _m.get("parts") if isinstance(_m.get("parts"), list) else []
-                        _non_empty = any(
-                            isinstance(p, dict) and (str(p.get("text") or "").strip() or any(k != "text" for k in p))
-                            for p in _pts
-                        )
-                        if _non_empty:
-                            _m_copy = dict(_m)
-                            _m_copy["role"] = "user"
-                            cleaned_contents.append(_m_copy)
-                        continue
-                    cleaned_contents.append(_m)
-                contents = cleaned_contents
-                payload["contents"] = contents
-
-            for _msg in contents:
-                if not isinstance(_msg, dict) or _msg.get("role") != "model":
-                    continue
-                _parts = _msg.get("parts")
-                if not isinstance(_parts, list):
-                    continue
-                _fc_parts = [p for p in _parts if isinstance(p, dict) and ("functionCall" in p or "function_call" in p)]
-                if _fc_parts and not any(p.get("thoughtSignature") or p.get("thought_signature") for p in _fc_parts):
-                    _turn_sig = next(
-                        (p.get("thoughtSignature") or p.get("thought_signature") for p in _parts if isinstance(p, dict) and (p.get("thoughtSignature") or p.get("thought_signature"))),
-                        None,
+    if not isinstance(payload, dict):
+        return payload
+    is_vertex = _is_vertex_provider(engine, provider)
+    contents = payload.get("contents")
+    if isinstance(contents, list):
+        if not is_vertex:
+            # AIS 渠道 (generativelanguage.googleapis.com) 的 contents 仅允许 role 为 user/model，
+            # 严禁出现 role="system"（如客户端针对 Vertex 追加的尾部空 system 块）。
+            cleaned_contents = []
+            for _m in contents:
+                if isinstance(_m, dict) and _m.get("role") == "system":
+                    _pts = _m.get("parts") if isinstance(_m.get("parts"), list) else []
+                    _non_empty = any(
+                        isinstance(p, dict) and (str(p.get("text") or "").strip() or any(k != "text" for k in p))
+                        for p in _pts
                     )
-                    _fc_parts[0]["thoughtSignature"] = _turn_sig or "skip_thought_signature_validator"
-            if not contents or (isinstance(contents[-1], dict) and contents[-1].get("role") == "model"):
-                contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
-        s_key = "safetySettings" if "safetySettings" in payload else ("safety_settings" if "safety_settings" in payload else None)
-        if s_key and isinstance(payload.get(s_key), list):
-            items = [x for x in payload[s_key] if isinstance(x, dict)]
-            if not is_vertex:
-                # AIS 渠道过滤掉 Vertex 专属的 HARM_CATEGORY_IMAGE_* 避免 400
-                payload[s_key] = [
-                    x for x in items
-                    if x.get("category") not in _VERTEX_EXTRA_HARM_CATEGORIES
-                ]
-            else:
-                # Vertex 渠道自动补齐缺失的 4 个 IMAGE_* 分类
-                existing = {x.get("category") for x in items}
-                default_thresh = next((x.get("threshold") for x in items if x.get("threshold")), "OFF")
-                for c in _VERTEX_EXTRA_HARM_CATEGORIES:
-                    if c not in existing:
-                        items.append({"category": c, "threshold": default_thresh})
-                payload[s_key] = items
-
-        raw_tools = payload.get("tools")
-        if isinstance(raw_tools, list):
-            for _t_group in raw_tools:
-                if not isinstance(_t_group, dict):
+                    if _non_empty:
+                        _m_copy = dict(_m)
+                        _m_copy["role"] = "user"
+                        cleaned_contents.append(_m_copy)
                     continue
-                _decls = _t_group.get("functionDeclarations") or _t_group.get("function_declarations")
-                if isinstance(_decls, list):
-                    for _decl in _decls:
-                        if isinstance(_decl, dict) and isinstance(_decl.get("parameters"), dict):
-                            inline_schema_refs(_decl["parameters"])
-                            process_tool_parameters(_decl["parameters"])
+                cleaned_contents.append(_m)
+            contents = cleaned_contents
+            payload["contents"] = contents
+
+        for _msg in contents:
+            if not isinstance(_msg, dict) or _msg.get("role") != "model":
+                continue
+            _parts = _msg.get("parts")
+            if not isinstance(_parts, list):
+                continue
+            _fc_parts = [p for p in _parts if isinstance(p, dict) and ("functionCall" in p or "function_call" in p)]
+            if _fc_parts and not any(p.get("thoughtSignature") or p.get("thought_signature") for p in _fc_parts):
+                _turn_sig = next(
+                    (p.get("thoughtSignature") or p.get("thought_signature") for p in _parts if isinstance(p, dict) and (p.get("thoughtSignature") or p.get("thought_signature"))),
+                    None,
+                )
+                _fc_parts[0]["thoughtSignature"] = _turn_sig or "skip_thought_signature_validator"
+        if not contents or (isinstance(contents[-1], dict) and contents[-1].get("role") == "model"):
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+    s_key = "safetySettings" if "safetySettings" in payload else ("safety_settings" if "safety_settings" in payload else None)
+    if s_key and isinstance(payload.get(s_key), list):
+        items = [x for x in payload[s_key] if isinstance(x, dict)]
+        if not is_vertex:
+            # AIS 渠道过滤掉 Vertex 专属的 HARM_CATEGORY_IMAGE_* 避免 400
+            payload[s_key] = [
+                x for x in items
+                if x.get("category") not in _VERTEX_EXTRA_HARM_CATEGORIES
+            ]
+        else:
+            # Vertex 渠道自动补齐缺失的 4 个 IMAGE_* 分类
+            existing = {x.get("category") for x in items}
+            default_thresh = next((x.get("threshold") for x in items if x.get("threshold")), "OFF")
+            for c in _VERTEX_EXTRA_HARM_CATEGORIES:
+                if c not in existing:
+                    items.append({"category": c, "threshold": default_thresh})
+            payload[s_key] = items
+
+    raw_tools = payload.get("tools")
+    if isinstance(raw_tools, list):
+        for _t_group in raw_tools:
+            if not isinstance(_t_group, dict):
+                continue
+            _decls = _t_group.get("functionDeclarations") or _t_group.get("function_declarations")
+            if isinstance(_decls, list):
+                for _decl in _decls:
+                    if isinstance(_decl, dict) and isinstance(_decl.get("parameters"), dict):
+                        inline_schema_refs(_decl["parameters"])
+                        process_tool_parameters(_decl["parameters"])
 
     system_prompt = (modifications or {}).get("system_prompt") if isinstance(modifications, dict) else None
     system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
@@ -1018,7 +1023,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     return url, headers, normalize_gemini_payload(payload)
 
 
-def _extract_gemini_block_message(response_json: dict) -> str | None:
+def _extract_gemini_block_message(response_json: Any) -> str | None:
     if not isinstance(response_json, dict):
         return None
     return (
@@ -1028,7 +1033,7 @@ def _extract_gemini_block_message(response_json: dict) -> str | None:
     )
 
 
-def _normalize_gemini_http_error(error_message: dict) -> dict:
+def _normalize_gemini_http_error(error_message: Any) -> dict:
     """把 Gemini/FirebaseVertex 的 HTTP 错误归一化成可直接返回给用户的 message。"""
     if not isinstance(error_message, dict):
         return {"error": "Gemini HTTP Error", "status_code": 400, "details": str(error_message)}
@@ -1131,9 +1136,9 @@ def gemini_json_process(response_json):
                 function_full_response = current_function_full_response
 
     if finishReason:
-        promptTokenCount = (safe_get(response_json, "usageMetadata", "promptTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "toolUsePromptTokenCount", default=0) or 0)
-        candidatesTokenCount = (safe_get(response_json, "usageMetadata", "candidatesTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "thoughtsTokenCount", default=0) or 0)
-        totalTokenCount = safe_get(response_json, "usageMetadata", "totalTokenCount", default=0) or (promptTokenCount + candidatesTokenCount)
+        promptTokenCount = (safe_get(response_json, "usageMetadata", "promptTokenCount") or 0) + (safe_get(response_json, "usageMetadata", "toolUsePromptTokenCount") or 0)
+        candidatesTokenCount = (safe_get(response_json, "usageMetadata", "candidatesTokenCount") or 0) + (safe_get(response_json, "usageMetadata", "thoughtsTokenCount") or 0)
+        totalTokenCount = safe_get(response_json, "usageMetadata", "totalTokenCount") or (promptTokenCount + candidatesTokenCount)
         if finishReason != "STOP":
             logger.error(f"finishReason: {finishReason}")
 
@@ -1223,9 +1228,9 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         last_resp = parsed_data[-1]
         usage_metadata = safe_get(last_resp, "usageMetadata")
         if isinstance(usage_metadata, dict):
-            prompt_tokens = (usage_metadata.get("promptTokenCount", 0) or 0) + (usage_metadata.get("toolUsePromptTokenCount", 0) or 0)
-            candidates_tokens = (usage_metadata.get("candidatesTokenCount", 0) or 0) + (usage_metadata.get("thoughtsTokenCount", 0) or 0)
-            total_tokens = usage_metadata.get("totalTokenCount", 0) or (prompt_tokens + candidates_tokens)
+            prompt_tokens = (usage_metadata.get("promptTokenCount") or 0) + (usage_metadata.get("toolUsePromptTokenCount") or 0)
+            candidates_tokens = (usage_metadata.get("candidatesTokenCount") or 0) + (usage_metadata.get("thoughtsTokenCount") or 0)
+            total_tokens = usage_metadata.get("totalTokenCount") or (prompt_tokens + candidates_tokens)
         else:
             prompt_tokens = promptTokenCount
             candidates_tokens = candidatesTokenCount

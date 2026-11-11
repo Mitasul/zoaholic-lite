@@ -38,7 +38,7 @@ from core.utils import (
     parse_json_safely,
 )
 from core.json_utils import json_dumps_text, json_loads
-from core.config.codec import _YamlHelper, _quote_colon_strings, yaml
+from core.config.codec import _YamlHelper, quote_colon_strings, yaml
 from core.config.file_store import API_YAML_PATH, _BASE_DIR, save_api_yaml
 from core.config.loader import load_config, yaml_error_message
 from core.config.service import (
@@ -49,10 +49,13 @@ from core.config.service import (
 )
 from core.config.serialization import (
     _rebuild_api_with_labels,
-    _sanitize_config_for_persistence,
+    sanitize_config_for_persistence,
     dump_config_to_json_obj,
     dump_config_to_yaml_text,
 )
+
+_quote_colon_strings = quote_colon_strings
+_sanitize_config_for_persistence = sanitize_config_for_persistence
 from core.config.db_store import load_config_from_db, save_config_to_db
 from core.http_headers import _set_header_case_insensitive, apply_custom_headers, has_header_case_insensitive
 from core.key_stats import _query_channel_key_stats_d1, get_sorted_api_keys, query_channel_key_stats

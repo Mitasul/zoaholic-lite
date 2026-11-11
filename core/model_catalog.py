@@ -29,11 +29,11 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
     # 修改原因：虚拟模型名需要出现在 /v1/models 中，但只能展示当前 API Key 有权限访问的条目。
     # 修改方式：读取 preferences.virtual_models，保留 enabled 不为 false 且被 model 数组或 all 授权的虚拟名。
     # 目的：让客户端可以发现可用虚拟模型，同时不引入新的授权机制。
-    virtual_models = safe_get(config, 'preferences', 'virtual_models', default={}) or {}
+    virtual_models = safe_get(config, 'preferences', 'virtual_models', default=None) or {}
     if not isinstance(virtual_models, dict):
         return
 
-    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=[]) or []
+    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=None) or []
     normalized_rules = []
     for rule in model_rules:
         if isinstance(rule, dict) and rule:

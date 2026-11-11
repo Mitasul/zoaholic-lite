@@ -596,9 +596,9 @@ class ClaudeCodeProvider(OAuthProvider):
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(token_url, json=data, headers=headers)
                 if response.status_code >= 400:
-                    message = getattr(response, "text", "")
+                    message = response.text
                     if refresh_token and response.status_code == 429:
-                        retry_after = _parse_retry_after(getattr(response, "headers", None))
+                        retry_after = _parse_retry_after(response.headers)
                         _claude_refresh_blocked_until[refresh_token] = time.time() + retry_after
                         raise _RefreshHTTPError(response.status_code, message, retryable=False)
                     if refresh_token:
@@ -861,7 +861,7 @@ _BILLING_ENTRYPOINT = "cli"
 
 def _sample_js_code_unit(text: str, idx: int) -> str:
     """按 JavaScript UTF-16 code unit 语义采样单个字符。"""
-    if not isinstance(text, str) or idx < 0:
+    if idx < 0:
         return "0"
     utf16_le = text.encode("utf-16-le")
     start = idx * 2
@@ -916,12 +916,6 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, versi
     Layer 3: Tool name 重命名为 CC PascalCase
     Layer 4: Strip system prompt 中的配置节结构
     """
-    if not isinstance(payload, dict):
-        return payload
-
-    # 修改原因：同一异步上下文可能在异常或重试后复用，旧反向映射不应影响新请求。
-    # 修改方式：每次清洗 payload 前先清空上一轮保存在 ContextVar 中的映射和 token。
-    # 目的：保证本次请求只使用本次 sanitize 产生的反向映射。
     _reset_reverse_maps()
 
     # ── Layer 1: system prompt 重写 ──
@@ -1305,9 +1299,9 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
 
 async def _passthrough_stream_with_reverse_map(client, url, headers, payload, model, timeout):
     """透传流式响应：对每个 chunk 执行反向工具名映射。"""
-    from core.passthrough import _fetch_passthrough_stream
+    from core.passthrough import fetch_passthrough_stream
     try:
-        async for chunk in _fetch_passthrough_stream(client, url, headers, payload, timeout):
+        async for chunk in fetch_passthrough_stream(client, url, headers, payload, timeout):
             if isinstance(chunk, str):
                 yield _reverse_map_chunk(chunk)
             else:
@@ -1318,9 +1312,9 @@ async def _passthrough_stream_with_reverse_map(client, url, headers, payload, mo
 
 async def _passthrough_response_with_reverse_map(client, url, headers, payload, model, timeout):
     """透传非流式响应：对每个 chunk 执行反向工具名映射。"""
-    from core.passthrough import _fetch_passthrough_response
+    from core.passthrough import fetch_passthrough_response
     try:
-        async for chunk in _fetch_passthrough_response(client, url, headers, payload, timeout):
+        async for chunk in fetch_passthrough_response(client, url, headers, payload, timeout):
             if isinstance(chunk, str):
                 yield _reverse_map_chunk(chunk)
             else:

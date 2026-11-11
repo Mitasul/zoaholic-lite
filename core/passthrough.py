@@ -123,8 +123,8 @@ def _passthrough_scrub_preferences(provider: Optional[Dict[str, Any]]) -> tuple:
     return _names("keep_passthrough_headers"), _names("strip_passthrough_headers")
 
 
-def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
-                                provider: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
+                               provider: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """过滤入口请求头，避免透传错误信息到上游。
 
     修改原因：旧实现只删 7 个认证/传输头，nginx/CF 注入的客户端真实 IP（x-forwarded-for、
@@ -190,7 +190,10 @@ def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
     return result
 
 
-async def _fetch_passthrough_stream(
+_filter_passthrough_headers = filter_passthrough_headers
+
+
+async def fetch_passthrough_stream(
     client,
     url,
     headers,
@@ -210,8 +213,8 @@ async def _fetch_passthrough_stream(
     
     读取超时遵循渠道配置；心跳只维持下游连接，不延长上游读取期限。
     """
-    from .response import _log_upstream_request, _apply_response_path_interceptors
-    _log_upstream_request(url, payload)
+    from .response import log_upstream_request, apply_response_path_interceptors
+    log_upstream_request(url, payload)
     
     stream_timeout = httpx.Timeout(
         connect=15.0,
@@ -227,7 +230,7 @@ async def _fetch_passthrough_stream(
             # 修改原因：透传流式错误响应也要按 response → channel_outbound → key_outbound 的顺序处理。
             # 修改方式：复用 response.py 的统一返回路径 helper，并传入渠道与 Key 级插件上下文。
             # 目的：避免透传错误分支遗漏新增出站阶段。
-            error_message = await _apply_response_path_interceptors(
+            error_message = await apply_response_path_interceptors(
                 error_message, engine or "passthrough", model or "", is_stream=True,
                 enabled_plugins=enabled_plugins,
                 provider=provider,
@@ -241,7 +244,7 @@ async def _fetch_passthrough_stream(
         # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
         async for text in response.aiter_text():
             if text:
-                text = await _apply_response_path_interceptors(
+                text = await apply_response_path_interceptors(
                     text, engine or "passthrough", model or "", is_stream=True,
                     enabled_plugins=enabled_plugins,
                     provider=provider,
@@ -251,7 +254,10 @@ async def _fetch_passthrough_stream(
                 yield text
 
 
-async def _fetch_passthrough_response(
+_fetch_passthrough_stream = fetch_passthrough_stream
+
+
+async def fetch_passthrough_response(
     client,
     url,
     headers,
@@ -269,8 +275,8 @@ async def _fetch_passthrough_response(
     
     直接转发上游 JSON 响应，不做任何格式转换
     """
-    from .response import _log_upstream_request, _apply_response_path_interceptors
-    _log_upstream_request(url, payload)
+    from .response import log_upstream_request, apply_response_path_interceptors
+    log_upstream_request(url, payload)
     
     import time as _time
     t0 = _time.time()
@@ -443,6 +449,9 @@ async def _passthrough_error_wrapper(generator, channel_id="passthrough", keepal
     return OwnedAsyncIterator(final_gen(first=first), gen), first_response_time or (time_now() - start_time)
 
 
+passthrough_error_wrapper = _passthrough_error_wrapper
+
+
 async def process_request_passthrough(
     request: RequestModel,
     provider: Dict[str, Any],
@@ -466,10 +475,7 @@ async def process_request_passthrough(
     - payload 取入口原生请求 + 轻量修改
     - 不跑上游响应的 Canonical 转换
     """
-    # 修改原因：core.handler 顶层需要重新导出透传函数，顶层反向导入 handler 状态会形成循环导入。
-    # 修改方式：在透传请求执行时延迟导入 handler 中保留的 helper 和 debug 标志。
-    # 目的：共享 set_debug_mode、OAuth 解析和统计写入逻辑，同时避免模块初始化时互相等待。
-    from core.handler import _fire_and_forget_channel_stats, _resolve_oauth_api_key, is_debug
+    from core.handler import fire_and_forget_channel_stats, resolve_oauth_api_key, is_debug
 
     from core.dialects.passthrough import apply_passthrough_modifications
     from core.plugins.interceptors import apply_request_interceptors
@@ -522,15 +528,17 @@ async def process_request_passthrough(
     # 修改方式：在透传请求早期保存 _oauth_channel_id，并按当前 provider name 解析 OAuth key_id。
     # 目的：避免透传请求从其他渠道读取同名账号凭据。
     current_info_early["_oauth_channel_id"] = channel_id
-    api_key = await _resolve_oauth_api_key(app, api_key, channel_id=channel_id)
+    api_key = await resolve_oauth_api_key(app, api_key, channel_id=channel_id)
 
     engine, stream_override, stream_mode = get_engine(provider, endpoint, original_model)
     if stream_override is not None:
         request.stream = stream_override
 
     channel = get_channel(engine)
-    adapter = (channel.passthrough_adapter if channel else None) or (channel.request_adapter if channel else None)
-    if not adapter:
+    if channel is None:
+        raise ValueError(f"Unknown engine: {engine}")
+    adapter = channel.passthrough_adapter if channel.passthrough_adapter is not None else channel.request_adapter
+    if adapter is None:
         raise ValueError(f"Unknown engine: {engine}")
 
     # 提前计算代理，以便 adapter 内部创建的裸 httpx.AsyncClient 也能走代理
@@ -583,7 +591,7 @@ async def process_request_passthrough(
             if str(_hk).lower() == "anthropic-version" and _hv:
                 payload["_inbound_anthropic_version"] = str(_hv).strip()
                 break
-    if channel and getattr(channel, "passthrough_payload_adapter", None):
+    if channel.passthrough_payload_adapter is not None:
         payload = await channel.passthrough_payload_adapter(
             payload,
             passthrough_ctx.modifications,
@@ -622,7 +630,7 @@ async def process_request_passthrough(
         current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
         # upstream_request_body 已移到 response.py fetch 层记录
 
-    if getattr(request, "model", None):
+    if request.model:
         current_info["model"] = request.model
 
     current_info["provider_id"] = channel_id
@@ -669,6 +677,19 @@ async def process_request_passthrough(
         payload["stream"] = False
         logger.info(f"[stream_mode/passthrough] force_non_stream: client=stream, upstream=non-stream, model={original_model}")
 
+    if (
+        upstream_stream
+        and engine in ("openai", "openrouter")
+        and isinstance(payload, dict)
+        and "api.x.ai" not in url
+        and not url.rstrip("/").endswith("/responses")
+    ):
+        existing_stream_opts = payload.get("stream_options")
+        if isinstance(existing_stream_opts, dict):
+            payload = {**payload, "stream_options": {**existing_stream_opts, "include_usage": True}}
+        else:
+            payload = {**payload, "stream_options": {"include_usage": True}}
+
     # Gemini/Vertex URL 适配
     if upstream_stream and "generateContent" in url and "streamGenerateContent" not in url:
         url = url.replace("generateContent", "streamGenerateContent")
@@ -690,19 +711,16 @@ async def process_request_passthrough(
                 # 修改原因：AWS Bedrock 透传流式响应不是普通 SSE，默认处理器无法解析二进制事件流。
                 # 修改方式：若渠道注册了 passthrough_stream_adapter，则优先使用渠道专用处理器。
                 # 目的：只让需要特殊解码的渠道接管透传响应读取，其他渠道继续走通用原样转发。
-                if channel and getattr(channel, "passthrough_stream_adapter", None):
+                if channel.passthrough_stream_adapter is not None:
                     raw_generator = channel.passthrough_stream_adapter(
                         client, url, headers, payload, original_model, timeout_value
                     )
 
                     async def passthrough_stream_adapter_with_outbound():
-                        from .response import _apply_response_path_interceptors
-                        # 修改原因：专用透传流式 adapter 不经过 _fetch_passthrough_stream，旧逻辑会绕过 response 和新增出站阶段。
-                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
-                        # 目的：让 AWS Bedrock 等专用透传流式响应也覆盖 channel_outbound 和 key_outbound。
+                        from .response import apply_response_path_interceptors
                         try:
                             async for chunk in raw_generator:
-                                yield await _apply_response_path_interceptors(
+                                yield await apply_response_path_interceptors(
                                     chunk, engine, request.model, is_stream=True,
                                     enabled_plugins=enabled_plugins,
                                     provider=provider,
@@ -715,7 +733,7 @@ async def process_request_passthrough(
                     generator = passthrough_stream_adapter_with_outbound()
                 else:
                     # 透传模式：使用原始流处理，不做格式转换
-                    generator = _fetch_passthrough_stream(
+                    generator = fetch_passthrough_stream(
                         client, url, headers, payload, timeout_value,
                         engine=engine, model=request.model,
                         enabled_plugins=enabled_plugins,
@@ -724,7 +742,7 @@ async def process_request_passthrough(
                         key_enabled_plugins=key_enabled_plugins,
                     )
                 # 使用简单的透传错误包装器，不做 JSON 解析
-                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                wrapped_generator, first_response_time = await passthrough_error_wrapper(
                     generator, channel_id, keepalive_interval=keepalive_interval,
                     stream_header_timeout=stream_header_timeout,
                     current_info=current_info,
@@ -761,19 +779,16 @@ async def process_request_passthrough(
                 # 修改原因：少数渠道需要在透传非流式路径中复用自己的上游响应读取逻辑。
                 # 修改方式：若渠道注册了 passthrough_response_adapter，则优先调用该处理器。
                 # 目的：让 AWS Bedrock 的 invoke 响应可以与流式透传一样收敛在 AWS channel 内。
-                if channel and getattr(channel, "passthrough_response_adapter", None):
+                if channel.passthrough_response_adapter is not None:
                     raw_generator = channel.passthrough_response_adapter(
                         client, url, headers, payload, original_model, timeout_value
                     )
 
                     async def passthrough_response_adapter_with_outbound():
-                        from .response import _apply_response_path_interceptors
-                        # 修改原因：专用透传非流式 adapter 不经过 _fetch_passthrough_response，旧逻辑会绕过 response 和新增出站阶段。
-                        # 修改方式：只在专用 adapter 分支包一层 async generator，按统一顺序处理每个 chunk。
-                        # 目的：让 AWS Bedrock 等专用透传非流式响应也覆盖 channel_outbound 和 key_outbound。
+                        from .response import apply_response_path_interceptors
                         try:
                             async for chunk in raw_generator:
-                                yield await _apply_response_path_interceptors(
+                                yield await apply_response_path_interceptors(
                                     chunk, engine, request.model, is_stream=False,
                                     enabled_plugins=enabled_plugins,
                                     provider=provider,
@@ -786,7 +801,7 @@ async def process_request_passthrough(
                     generator = passthrough_response_adapter_with_outbound()
                 else:
                     # 透传模式：使用原始响应处理，不做格式转换
-                    generator = _fetch_passthrough_response(
+                    generator = fetch_passthrough_response(
                         client, url, headers, payload, timeout_value,
                         engine=engine, model=request.model,
                         enabled_plugins=enabled_plugins,
@@ -795,7 +810,7 @@ async def process_request_passthrough(
                         key_enabled_plugins=key_enabled_plugins,
                     )
                 # 使用简单的透传错误包装器，不做 JSON 解析
-                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                wrapped_generator, first_response_time = await passthrough_error_wrapper(
                     generator, channel_id, stream=False, current_info=current_info
                 )
 
@@ -830,7 +845,7 @@ async def process_request_passthrough(
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
             httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
             httpx.ConnectError) as e:
-        _fire_and_forget_channel_stats(
+        fire_and_forget_channel_stats(
             update_channel_stats_func,
             current_info["request_id"],
             channel_id,
@@ -850,7 +865,7 @@ async def process_request_passthrough(
             update_channel_stats_func, stats_args, {"provider_api_key": original_api_key},
         )
     else:
-        _fire_and_forget_channel_stats(
+        fire_and_forget_channel_stats(
             update_channel_stats_func, *stats_args, success=True, provider_api_key=original_api_key,
         )
     current_info["success"] = True

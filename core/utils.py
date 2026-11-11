@@ -7,6 +7,8 @@
 """
 
 import json
+import re
+from typing import Any, List, Optional
 import httpx
 import traceback
 from httpx_socks import AsyncProxyTransport
@@ -20,15 +22,19 @@ from .log_config import logger
 from core.key_pool import (
     parse_rate_limit, ThreadSafeCircularList, circular_list_encoder,
     ApiKeyRateLimitRegistry, provider_api_circular_list,
-    _save_all_auto_disabled, load_auto_disabled_snapshot, restore_auto_disabled,
+    save_all_auto_disabled, load_auto_disabled_snapshot, restore_auto_disabled,
 )
 from core.response_builders import (
     end_of_line, generate_sse_response, generate_no_stream_response,
     generate_chunked_image_md, get_image_format, encode_image,
     get_image_from_url, get_encode_image, get_base64_image,
-    _convert_webp_base64_to_png, _prepare_image_for_upload,
+    convert_webp_base64_to_png, prepare_image_for_upload,
     parse_json_safely,
 )
+
+_save_all_auto_disabled = save_all_auto_disabled
+_convert_webp_base64_to_png = convert_webp_base64_to_png
+_prepare_image_for_upload = prepare_image_for_upload
 
 # 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
 # sk- 是历史前缀，zk- 是新版本前缀，两者都需要兼容
@@ -402,3 +408,56 @@ def truncate_for_logging(
         serialized = serialized[:max_total_size] + f"... [截断总计 {len(serialized) - max_total_size} 字符]"
 
     return serialized
+
+
+_QUERY_SECRET_RE = re.compile(
+    r'((?:[?&]|\b)(?:key|api_key|apikey|token|access_token|client_secret|secret)=)([^&\s"\'\)\]]+)',
+    re.IGNORECASE,
+)
+_BEARER_SECRET_RE = re.compile(
+    r'\b(Bearer\s+)[A-Za-z0-9._\-]{12,}',
+    re.IGNORECASE,
+)
+_KNOWN_KEY_PATTERNS_RE = re.compile(
+    r'\b(?:AIza[0-9A-Za-z_\-]{20,}|AQ\.[0-9A-Za-z_\-.]{16,}|sk-[0-9A-Za-z_\-]{16,}|zk-[0-9A-Za-z_\-]{16,})\b'
+)
+
+
+def scrub_sensitive_error_text(text: Any, extra_secrets: Optional[List[Optional[str]]] = None) -> str:
+    """脱敏异常或错误文本中的上游 API Key、URL Query 密钥与 Bearer Token。"""
+    raw = str(text or "")
+    if not raw:
+        return raw
+
+    if extra_secrets:
+        for secret in extra_secrets:
+            if isinstance(secret, str):
+                cleaned = secret.strip()
+                if len(cleaned) >= 6 and cleaned in raw:
+                    raw = raw.replace(cleaned, "***")
+
+    raw = _QUERY_SECRET_RE.sub(r"\1***", raw)
+    raw = _BEARER_SECRET_RE.sub(r"\1***", raw)
+    raw = _KNOWN_KEY_PATTERNS_RE.sub("***", raw)
+    return raw
+
+
+def is_valid_model_name(model_name: str, *, check_encoded: bool = False) -> bool:
+    """校验模型名是否合法（拒绝路径穿越符、URL 查询/锚点分隔符与控制字符）。"""
+    if not model_name:
+        return False
+    if (
+        ".." in model_name
+        or "\\" in model_name
+        or "?" in model_name
+        or "#" in model_name
+        or any(ord(ch) < 32 for ch in model_name)
+    ):
+        return False
+    if check_encoded:
+        lowered = model_name.lower()
+        if "%2e" in lowered or "%2f" in lowered or "%5c" in lowered:
+            return False
+    return True
+
+

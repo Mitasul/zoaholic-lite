@@ -7,7 +7,7 @@
 # 目的：让业务代码按领域归属维护，同时保留根 utils.py 和 utils_pkg shim 的旧导入兼容性。
 from fastapi.encoders import jsonable_encoder
 
-from .codec import _quote_colon_strings, yaml
+from .codec import quote_colon_strings, yaml
 
 
 def _rebuild_api_with_labels(provider: dict) -> None:
@@ -47,7 +47,7 @@ def _rebuild_api_with_labels(provider: dict) -> None:
         provider["api"] = rebuilt
 
 
-def _sanitize_config_for_persistence(config_data: dict) -> dict:
+def sanitize_config_for_persistence(config_data: dict) -> dict:
     """清理配置中的运行时字段，返回可持久化的 dict。
 
     - 移除 providers/api_keys 中以 "_" 开头的运行时字段
@@ -80,13 +80,16 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
     return processed_data
 
 
+_sanitize_config_for_persistence = sanitize_config_for_persistence
+
+
 def dump_config_to_json_obj(config_data: dict) -> dict:
     """将配置 dict 转为可写入 JSON/JSONB 的对象。
 
     使用 jsonable_encoder 处理 datetime 等类型，避免 JSON 序列化失败。
     """
 
-    processed_data = _sanitize_config_for_persistence(config_data)
+    processed_data = sanitize_config_for_persistence(config_data)
     return jsonable_encoder(processed_data)
 
 
@@ -95,8 +98,8 @@ def dump_config_to_yaml_text(config_data: dict) -> str:
 
     import io
 
-    processed_data = _sanitize_config_for_persistence(config_data)
-    processed_data = _quote_colon_strings(processed_data)
+    processed_data = sanitize_config_for_persistence(config_data)
+    processed_data = quote_colon_strings(processed_data)
 
     buf = io.StringIO()
     yaml.dump(processed_data, buf)
