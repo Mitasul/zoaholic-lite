@@ -82,7 +82,9 @@ CHANNEL_STATS_PROVIDER_TIMESTAMP_KEY_SUCCESS_REQUEST_INDEX_SQL = (
 # 目的：让仪表盘时序、速度、缓存率与热力图聚合直接走覆盖索引扫描。
 REQUEST_STATS_DASHBOARD_COVER_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_request_stats_dashboard_cover "
-    "ON request_stats(timestamp DESC, success, model, provider, prompt_tokens, completion_tokens, total_tokens, cached_tokens, process_time, first_response_time, prompt_price, completion_price)"
+    "ON request_stats(timestamp DESC, success, model, provider, api_key, api_key_name, api_key_group, "
+    "prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_creation_tokens, "
+    "process_time, first_response_time, prompt_price, completion_price)"
 )
 # 修改原因：D1 初始化和 SQLite 启动迁移需要共享同一组性能索引，避免两条数据库路径优化不一致。
 # 修改方式：将 Dashboard、日志列表和渠道分析所需的复合索引集中成不可变元组。

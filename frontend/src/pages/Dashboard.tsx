@@ -14,10 +14,11 @@
 import { useEffect, useState, useMemo } from 'react';
 import {
   Activity, Cpu, BarChart3, AlertCircle, CheckCircle2,
-  RefreshCw, Server, Search, X, ArrowUp, Filter, Calendar, Layers
+  RefreshCw, Server, Search, X, ArrowUp, Filter, Calendar, Layers, KeyRound
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { KeyAnalyticsSheet } from '../components/KeyAnalyticsSheet';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
   PieChart, Pie, Legend, LineChart, Line, CartesianGrid, ComposedChart
@@ -55,6 +56,7 @@ interface OverviewSummary {
   total_cost_usd: number;
   total_cost_cny: number;
   recorded_cost_usd: number;
+  active_keys?: number;
 }
 
 interface TimeseriesPoint {
@@ -93,12 +95,37 @@ interface AvailableProviderItem {
   cache_hit_rate: number;
 }
 
+interface AvailableKeyItem {
+  key_hash: string;
+  key_label: string;
+  api_key_name?: string | null;
+  api_key_prefix: string;
+  api_key_group?: string | null;
+  parent_name?: string | null;
+  can_drilldown: boolean;
+  requests: number;
+  total_tokens: number;
+  success_rate: number;
+  cache_hit_rate: number;
+  cost_usd: number;
+  cost_cny: number;
+}
+
+interface TopKeyItem {
+  key_hash: string;
+  key_label: string;
+}
+
 interface RecentRequestItem {
   id: number;
   timestamp: string;
   model: string;
   provider: string;
+  key_hash?: string;
   key_label: string;
+  api_key_prefix?: string;
+  api_key_group?: string | null;
+  can_drilldown?: boolean;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -161,6 +188,59 @@ interface CrossBreakdownRow {
   cost_cny: number;
 }
 
+interface KeyBreakdownRow {
+  key_hash: string;
+  key_label: string;
+  api_key_name?: string | null;
+  api_key_prefix: string;
+  api_key_group?: string | null;
+  parent_name?: string | null;
+  can_drilldown: boolean;
+  requests: number;
+  success_requests: number;
+  failed_requests: number;
+  success_rate: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  uncached_tokens: number;
+  cache_hit_rate: number;
+  speed_tok_s: number;
+  avg_process_time: number;
+  avg_ttft: number;
+  recorded_cost_usd: number;
+  cost_usd: number;
+  cost_cny: number;
+  token_share: number;
+  cost_share: number;
+  unique_models: number;
+  top_model: string;
+  last_used?: string | null;
+}
+
+interface KeyModelBreakdownRow {
+  key_hash: string;
+  key_label: string;
+  api_key_name?: string | null;
+  api_key_prefix: string;
+  api_key_group?: string | null;
+  parent_name?: string | null;
+  can_drilldown: boolean;
+  model: string;
+  requests: number;
+  success_rate: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens: number;
+  cache_hit_rate: number;
+  speed_tok_s: number;
+  recorded_cost_usd: number;
+  cost_usd: number;
+  cost_cny: number;
+}
+
 const RANGE_OPTIONS = [
   { key: '1h', label: '1 小时', hours: 1 },
   { key: '6h', label: '6 小时', hours: 6 },
@@ -176,6 +256,7 @@ type RangeKey = typeof RANGE_OPTIONS[number]['key'];
 
 const NAV_SECTIONS = [
   { id: 'section-overview', label: '总览与时序' },
+  { id: 'section-key-usage', label: 'Key 用量排行' },
   { id: 'section-distributions', label: '渠道与模型分布' },
   { id: 'section-channel-health', label: '渠道健康表' },
   { id: 'section-heatmap', label: '工作回溯' },
@@ -380,19 +461,22 @@ export default function Dashboard() {
 
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [selectedProviders, setSelectedProviders] = useState<string[]>([]);
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [showProviderDrawer, setShowProviderDrawer] = useState(false);
+  const [showKeyDrawer, setShowKeyDrawer] = useState(false);
+  const [analyticsTargetKey, setAnalyticsTargetKey] = useState<{ key_hash: string; key_label: string } | null>(null);
 
   // 导航与滚动监听状态
   const [activeAnchor, setActiveAnchor] = useState<string>('section-overview');
   const [isScrolled, setIsScrolled] = useState(false);
 
-  // 时序图模式：token (Token+请求) | cache (缓存/未缓存/输出堆叠) | models (分模型折线) | requests (成功/失败) | throughput (吞吐/首字)
-  const [chartMode, setChartMode] = useState<'token' | 'cache' | 'models' | 'requests' | 'throughput'>('token');
+  // 时序图模式：token (Token+请求) | cache (缓存/未缓存/输出堆叠) | models (分模型折线) | keys (分Key折线) | requests (成功/失败) | throughput (吞吐/首字)
+  const [chartMode, setChartMode] = useState<'token' | 'cache' | 'models' | 'keys' | 'requests' | 'throughput'>('token');
   // 是否展开双图并排视图（左边所选时序 + 右边分模型/缓存堆叠对比）
   const [dualChartCompare, setDualChartCompare] = useState(false);
 
   // 底部明细表 Tab 与搜索
-  const [breakdownTab, setBreakdownTab] = useState<'cross' | 'model' | 'provider'>('cross');
+  const [breakdownTab, setBreakdownTab] = useState<'cross' | 'key' | 'key_model' | 'model' | 'provider'>('cross');
   const [tableSearch, setTableSearch] = useState('');
 
   // 后端数据状态
@@ -400,15 +484,20 @@ export default function Dashboard() {
   const [summary, setSummary] = useState<OverviewSummary | null>(null);
   const [timeseries, setTimeseries] = useState<TimeseriesPoint[]>([]);
   const [modelTimeseries, setModelTimeseries] = useState<Record<string, any>[]>([]);
+  const [keyTimeseries, setKeyTimeseries] = useState<Record<string, any>[]>([]);
   const [topModels, setTopModels] = useState<string[]>([]);
+  const [topKeys, setTopKeys] = useState<TopKeyItem[]>([]);
   const [availableModels, setAvailableModels] = useState<AvailableModelItem[]>([]);
   const [availableProviders, setAvailableProviders] = useState<AvailableProviderItem[]>([]);
+  const [availableKeys, setAvailableKeys] = useState<AvailableKeyItem[]>([]);
   const [recentRequests, setRecentRequests] = useState<RecentRequestItem[]>([]);
   const [recentTotal, setRecentTotal] = useState(0);
   const [heatmap, setHeatmap] = useState<ActivityHeatmapData | null>(null);
   const [modelBreakdown, setModelBreakdown] = useState<BreakdownRow[]>([]);
   const [providerBreakdown, setProviderBreakdown] = useState<BreakdownRow[]>([]);
+  const [keyBreakdown, setKeyBreakdown] = useState<KeyBreakdownRow[]>([]);
   const [crossBreakdown, setCrossBreakdown] = useState<CrossBreakdownRow[]>([]);
+  const [keyModelBreakdown, setKeyModelBreakdown] = useState<KeyModelBreakdownRow[]>([]);
   const [stats, setStats] = useState<StatData | null>(null);
   const [hoveredDay, setHoveredDay] = useState<HeatmapDay | null>(null);
 
@@ -426,6 +515,7 @@ export default function Dashboard() {
     if (customEnd) params.set('end_datetime', new Date(customEnd).toISOString());
     if (selectedModels.length > 0) params.set('model', selectedModels.join(','));
     if (selectedProviders.length > 0) params.set('provider', selectedProviders.join(','));
+    if (selectedKeys.length > 0) params.set('key_hash', selectedKeys.join(','));
 
     try {
       const [overviewRes, statsRes] = await Promise.all([
@@ -439,15 +529,20 @@ export default function Dashboard() {
           setSummary(data.summary || null);
           setTimeseries(data.timeseries || []);
           setModelTimeseries(data.model_timeseries || []);
+          setKeyTimeseries(data.key_timeseries || []);
           setTopModels(data.top_models || []);
+          setTopKeys(data.top_keys || []);
           setAvailableModels(data.available_models || []);
           setAvailableProviders(data.available_providers || []);
+          setAvailableKeys(data.available_keys || []);
           setRecentRequests(data.recent_requests || []);
           setRecentTotal(data.recent_total || 0);
           setHeatmap(data.activity_heatmap || null);
           setModelBreakdown(data.model_breakdown || []);
           setProviderBreakdown(data.provider_breakdown || []);
+          setKeyBreakdown(data.key_breakdown || []);
           setCrossBreakdown(data.cross_breakdown || []);
+          setKeyModelBreakdown(data.key_model_breakdown || []);
         }
       }
 
@@ -465,7 +560,7 @@ export default function Dashboard() {
   useEffect(() => {
     fetchDashboard();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, rangeKey, selectedModels, selectedProviders, customStart, customEnd]);
+  }, [token, rangeKey, selectedModels, selectedProviders, selectedKeys, customStart, customEnd]);
 
   // 监听外层 #app-main-scroll 滚动容器，实现 ScrollSpy 高亮与回到顶部状态感知
   useEffect(() => {
@@ -531,15 +626,26 @@ export default function Dashboard() {
     );
   };
 
+  const toggleKeyFilter = (keyHash: string) => {
+    if (!keyHash) return;
+    setSelectedKeys(prev =>
+      prev.includes(keyHash) ? prev.filter(k => k !== keyHash) : [...prev, keyHash]
+    );
+  };
+
   const clearAllFilters = () => {
     setSelectedModels([]);
     setSelectedProviders([]);
+    setSelectedKeys([]);
     setCustomStart('');
     setCustomEnd('');
   };
 
   const hasActiveFilter =
-    selectedModels.length > 0 || selectedProviders.length > 0 || Boolean(customStart || customEnd);
+    selectedModels.length > 0 ||
+    selectedProviders.length > 0 ||
+    selectedKeys.length > 0 ||
+    Boolean(customStart || customEnd);
 
   // 原版分布数据与过滤后数据的有机结合
   const channelStats = useMemo(() => {
@@ -678,6 +784,31 @@ export default function Dashboard() {
     if (!q) return providerBreakdown;
     return providerBreakdown.filter(r => (r.provider || '').toLowerCase().includes(q));
   }, [providerBreakdown, tableSearch]);
+
+  const filteredKeyRows = useMemo(() => {
+    const q = tableSearch.trim().toLowerCase();
+    if (!q) return keyBreakdown;
+    return keyBreakdown.filter(
+      r =>
+        r.key_label.toLowerCase().includes(q) ||
+        r.api_key_prefix.toLowerCase().includes(q) ||
+        (r.api_key_group || '').toLowerCase().includes(q) ||
+        (r.parent_name || '').toLowerCase().includes(q) ||
+        (r.top_model || '').toLowerCase().includes(q)
+    );
+  }, [keyBreakdown, tableSearch]);
+
+  const filteredKeyModelRows = useMemo(() => {
+    const q = tableSearch.trim().toLowerCase();
+    if (!q) return keyModelBreakdown;
+    return keyModelBreakdown.filter(
+      r =>
+        r.key_label.toLowerCase().includes(q) ||
+        r.api_key_prefix.toLowerCase().includes(q) ||
+        (r.api_key_group || '').toLowerCase().includes(q) ||
+        r.model.toLowerCase().includes(q)
+    );
+  }, [keyModelBreakdown, tableSearch]);
 
   const tooltipStyle = {
     backgroundColor: 'hsl(var(--popover))',
@@ -842,8 +973,23 @@ export default function Dashboard() {
               })}
             </div>
 
-            {/* 右侧：渠道筛选开关 + 一键重置过滤 */}
-            <div className="flex items-center gap-1.5 shrink-0">
+            {/* 右侧：Key 筛选开关 + 渠道筛选开关 + 一键重置过滤 */}
+            <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setShowKeyDrawer(v => !v)}
+                className={`inline-flex items-center gap-1 px-2.5 py-0.5 text-[11px] font-medium rounded-lg border transition-colors ${
+                  selectedKeys.length > 0 || showKeyDrawer
+                    ? 'bg-amber-500/15 text-amber-400 border-amber-500/40'
+                    : 'bg-muted/40 text-muted-foreground border-border/70 hover:text-foreground'
+                }`}
+              >
+                <KeyRound className="w-3 h-3" />
+                {selectedKeys.length > 0
+                  ? `已选 ${selectedKeys.length} 条 Key`
+                  : `按 Key 筛选 (${availableKeys.length})`}
+              </button>
+
               <button
                 type="button"
                 onClick={() => setShowProviderDrawer(v => !v)}
@@ -871,6 +1017,53 @@ export default function Dashboard() {
               )}
             </div>
           </div>
+
+          {/* 展开的 API Key 多选抽屉 */}
+          {showKeyDrawer && (
+            <div className="pt-2 border-t border-border/50 flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-muted-foreground mr-1">选择 API Key:</span>
+              <button
+                type="button"
+                onClick={() => setSelectedKeys([])}
+                className={`px-2 py-0.5 text-[11px] rounded-md border ${
+                  selectedKeys.length === 0
+                    ? 'bg-foreground text-background border-foreground font-semibold'
+                    : 'bg-muted/40 text-muted-foreground border-border/70'
+                }`}
+              >
+                全部 Key ({availableKeys.length})
+              </button>
+              {availableKeys.map(k => {
+                const active = selectedKeys.includes(k.key_hash);
+                return (
+                  <button
+                    key={k.key_hash}
+                    type="button"
+                    onClick={() => toggleKeyFilter(k.key_hash)}
+                    title={`${k.key_label} (${k.api_key_prefix})${k.api_key_group ? ` · 分组 ${k.api_key_group}` : ''} · 请求 ${k.requests} 次 · Token ${formatTokens(k.total_tokens)} · ¥${k.cost_cny.toFixed(2)}`}
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] rounded-md border transition-colors tabular-nums ${
+                      active
+                        ? 'bg-amber-500 text-slate-950 border-amber-500 font-semibold shadow-sm'
+                        : 'bg-muted/30 text-muted-foreground border-border/70 hover:text-foreground'
+                    }`}
+                  >
+                    <KeyRound className="w-2.5 h-2.5 opacity-80" />
+                    <span className="truncate max-w-[140px]">{k.key_label}</span>
+                    {k.api_key_group && (
+                      <span
+                        className={`text-[9px] px-1 rounded ${
+                          active ? 'bg-slate-950/20 text-slate-950' : 'bg-muted text-muted-foreground'
+                        }`}
+                      >
+                        {k.api_key_group}
+                      </span>
+                    )}
+                    <span className="opacity-75 text-[10px]">({formatTokens(k.total_tokens)})</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* 展开的渠道多选抽屉 */}
           {showProviderDrawer && (
@@ -1012,9 +1205,19 @@ export default function Dashboard() {
                   <span className="text-sky-400">⇄</span>
                   <span>请求数</span>
                 </span>
-                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-purple-500/10 text-purple-400 text-[10px]">
-                  渠道 {providerBreakdown.length}
-                </span>
+                <div className="inline-flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => scrollToSection('section-key-usage')}
+                    title="点击跳转到 Key 用量排行"
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 text-[10px] transition-colors"
+                  >
+                    Key {summary?.active_keys ?? keyBreakdown.length}
+                  </button>
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-purple-500/10 text-purple-400 text-[10px]">
+                    渠道 {providerBreakdown.length}
+                  </span>
+                </div>
               </div>
               <div className="mt-2 flex items-baseline gap-1">
                 <span className="text-3xl font-bold tracking-tight tabular-nums text-foreground">
@@ -1184,6 +1387,7 @@ export default function Dashboard() {
                     { key: 'token', label: 'Token+请求' },
                     { key: 'cache', label: '缓存堆叠' },
                     { key: 'models', label: '分模型趋势' },
+                    { key: 'keys', label: '分Key趋势' },
                     { key: 'requests', label: '成功/失败' },
                     { key: 'throughput', label: '吞吐与首字' },
                   ].map(tab => (
@@ -1191,7 +1395,7 @@ export default function Dashboard() {
                       key={tab.key}
                       type="button"
                       onClick={() =>
-                        setChartMode(tab.key as 'token' | 'cache' | 'models' | 'requests' | 'throughput')
+                        setChartMode(tab.key as 'token' | 'cache' | 'models' | 'keys' | 'requests' | 'throughput')
                       }
                       className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all ${
                         chartMode === tab.key
@@ -1345,6 +1549,33 @@ export default function Dashboard() {
                       ))}
                     </LineChart>
                   </ResponsiveContainer>
+                ) : chartMode === 'keys' ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={keyTimeseries} margin={{ top: 8, right: 6, left: -8, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border) / 0.45)" vertical={false} />
+                      <XAxis dataKey="label" stroke={AXIS_COLOR} fontSize={11} tickLine={false} axisLine={false} minTickGap={24} />
+                      <YAxis stroke={AXIS_COLOR} fontSize={11} tickLine={false} axisLine={false} tickFormatter={formatAxisTokens} />
+                      <Tooltip
+                        contentStyle={tooltipStyle}
+                        labelFormatter={(_, p) => p?.[0]?.payload?.bucket || ''}
+                        formatter={(val: number, name: string) => [formatTokens(val), name]}
+                      />
+                      <Legend iconType="circle" wrapperStyle={{ fontSize: '11px', paddingTop: '6px' }} />
+                      {topKeys.map((tk, i) => (
+                        <Line
+                          key={tk.key_hash}
+                          type="monotone"
+                          dataKey={`${tk.key_hash}__tokens`}
+                          name={tk.key_label}
+                          stroke={LINE_COLORS[i % LINE_COLORS.length]}
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls
+                          activeDot={{ r: 4 }}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
                 ) : chartMode === 'requests' ? (
                   <ResponsiveContainer width="100%" height="100%">
                     <ComposedChart data={timeseries} margin={{ top: 8, right: 6, left: -8, bottom: 0 }}>
@@ -1450,7 +1681,7 @@ export default function Dashboard() {
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-baseline gap-2">
                 <h3 className="text-sm font-bold tracking-wide text-foreground">最近请求</h3>
-                <span className="text-xs text-muted-foreground">点击模型/渠道可筛选</span>
+                <span className="text-xs text-muted-foreground">点击模型/渠道/Key 可筛选</span>
               </div>
               <span className="text-xs text-muted-foreground tabular-nums">
                 共 {recentTotal.toLocaleString()} 条记录
@@ -1496,6 +1727,21 @@ export default function Dashboard() {
                         >
                           {item.provider}
                         </button>
+                        {item.key_label && (
+                          <button
+                            type="button"
+                            onClick={() => item.key_hash && toggleKeyFilter(item.key_hash)}
+                            className={`ml-1 inline-flex items-center gap-0.5 px-1.5 py-0.2 rounded text-[10px] border transition-colors shrink-0 ${
+                              item.key_hash && selectedKeys.includes(item.key_hash)
+                                ? 'bg-amber-500/20 text-amber-400 border-amber-500/40 font-semibold'
+                                : 'bg-muted/50 text-muted-foreground border-border/60 hover:text-foreground'
+                            }`}
+                            title={`API Key: ${item.key_label}${item.api_key_prefix ? ` (${item.api_key_prefix})` : ''} · 点击只看该 Key`}
+                          >
+                            <KeyRound className="w-2.5 h-2.5 text-amber-400" />
+                            <span className="max-w-[85px] truncate">{item.key_label}</span>
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -1512,6 +1758,227 @@ export default function Dashboard() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* =====================================================================
+          2.5 API Key 用量排行与明细看板（查看哪条 Key 用量最多、Token/费用占比、缓存命中与一键下钻）
+         ===================================================================== */}
+      <div
+        id="section-key-usage"
+        className="bg-card border border-border/80 rounded-2xl p-5 shadow-sm space-y-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <KeyRound className="w-4 h-4 text-amber-400" />
+            <h3 className="text-sm font-bold text-foreground">API Key 用量排行</h3>
+            <span className="text-xs text-muted-foreground">
+              （共 {keyBreakdown.length} 条活跃 Key · 点击任意 Key 可联动全页筛选，点击「深度分析」可下钻查看 IP 与配额明细）
+            </span>
+          </div>
+          {selectedKeys.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSelectedKeys([])}
+              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 rounded-lg transition-colors"
+            >
+              <X className="w-3 h-3" />
+              取消 Key 过滤 ({selectedKeys.length})
+            </button>
+          )}
+        </div>
+
+        {keyBreakdown.length === 0 ? (
+          <div className="py-10 text-center text-xs text-muted-foreground border border-dashed border-border/60 rounded-xl">
+            当前时间范围与筛选条件下暂无 API Key 用量记录
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+            {/* 左栏：Top Key Token & 费用占比可视化卡片 */}
+            <div className="xl:col-span-5 bg-muted/20 border border-border/60 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-foreground">Top Key 消耗占比</span>
+                <span className="text-muted-foreground tabular-nums">
+                  总计 {formatTokens(summary?.total_tokens || 0)} tok · ¥{(summary?.total_cost_cny || 0).toFixed(2)}
+                </span>
+              </div>
+              <div className="space-y-2.5">
+                {keyBreakdown.slice(0, 6).map((k, idx) => {
+                  const isSelected = selectedKeys.includes(k.key_hash);
+                  return (
+                    <div
+                      key={k.key_hash}
+                      onClick={() => toggleKeyFilter(k.key_hash)}
+                      className={`p-2.5 rounded-xl border transition-all cursor-pointer ${
+                        isSelected
+                          ? 'bg-amber-500/10 border-amber-500/50 shadow-sm'
+                          : 'bg-card/80 border-border/60 hover:border-border'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className="w-5 h-5 rounded-md flex items-center justify-center text-[10px] font-bold text-white shrink-0"
+                            style={{ backgroundColor: LINE_COLORS[idx % LINE_COLORS.length] }}
+                          >
+                            {idx + 1}
+                          </span>
+                          <span className="font-semibold text-foreground truncate" title={k.key_label}>
+                            {k.key_label}
+                          </span>
+                          {k.api_key_name && (
+                            <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                              ({k.api_key_prefix})
+                            </span>
+                          )}
+                          {k.api_key_group && (
+                            <span className="px-1.5 py-0.2 rounded bg-muted text-muted-foreground text-[10px] shrink-0">
+                              {k.api_key_group}
+                            </span>
+                          )}
+                          {k.parent_name && (
+                            <span
+                              className="px-1.5 py-0.2 rounded bg-purple-500/10 text-purple-400 text-[10px] shrink-0"
+                              title={`子 Key，继承自母 Key: ${k.parent_name}`}
+                            >
+                              母:{k.parent_name}
+                            </span>
+                          )}
+                        </div>
+                        <div className="shrink-0 font-mono text-xs tabular-nums">
+                          <span className="font-bold text-foreground">{formatTokens(k.total_tokens)}</span>
+                          <span className="text-muted-foreground ml-1">({k.token_share.toFixed(1)}%)</span>
+                        </div>
+                      </div>
+
+                      <div className="mt-2 h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${Math.max(2, Math.min(100, k.token_share))}%`,
+                            backgroundColor: LINE_COLORS[idx % LINE_COLORS.length],
+                          }}
+                        />
+                      </div>
+
+                      <div className="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground tabular-nums">
+                        <span>
+                          请求 <strong className="text-foreground/90">{k.requests.toLocaleString()}</strong> 次 · 缓存{' '}
+                          <strong className="text-cyan-400">{k.cache_hit_rate.toFixed(1)}%</strong> · 主力{' '}
+                          <strong className="text-foreground/90">{k.top_model}</strong>
+                        </span>
+                        <span className="font-mono text-rose-400 font-semibold">
+                          ¥{k.cost_cny.toFixed(2)} (${k.cost_usd.toFixed(2)})
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* 右栏：Key 用量速览与下钻表 */}
+            <div className="xl:col-span-7 overflow-x-auto border border-border/70 rounded-xl">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-muted/60 text-muted-foreground font-medium">
+                  <tr>
+                    <th className="px-3.5 py-2.5">API Key 标识</th>
+                    <th className="px-3.5 py-2.5 text-right">请求数</th>
+                    <th className="px-3.5 py-2.5 text-right">成功率</th>
+                    <th className="px-3.5 py-2.5 text-right">输入 / 输出</th>
+                    <th className="px-3.5 py-2.5 text-right">缓存命中率</th>
+                    <th className="px-3.5 py-2.5 text-right">总 Token</th>
+                    <th className="px-3.5 py-2.5 text-right">等价费用</th>
+                    <th className="px-3.5 py-2.5 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/50 tabular-nums">
+                  {keyBreakdown.slice(0, 10).map(row => {
+                    const isSelected = selectedKeys.includes(row.key_hash);
+                    return (
+                      <tr
+                        key={row.key_hash}
+                        onClick={() => toggleKeyFilter(row.key_hash)}
+                        className={`cursor-pointer transition-colors ${
+                          isSelected ? 'bg-amber-500/10' : 'hover:bg-muted/30'
+                        }`}
+                        title="点击按该 Key 联动筛选全页"
+                      >
+                        <td className="px-3.5 py-2.5">
+                          <div className="flex items-center gap-1.5">
+                            <KeyRound className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                            <div>
+                              <div className="font-semibold text-foreground flex items-center gap-1.5">
+                                <span>{row.key_label}</span>
+                                {row.api_key_group && (
+                                  <span className="px-1.5 py-0.2 rounded bg-muted text-muted-foreground text-[10px] font-normal">
+                                    {row.api_key_group}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[10px] text-muted-foreground font-mono">
+                                {row.api_key_prefix}
+                                {row.top_model && row.top_model !== '-' ? ` · ${row.top_model}` : ''}
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right text-foreground font-medium">
+                          {row.requests.toLocaleString()}
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right">
+                          <span
+                            className={`font-semibold ${
+                              row.success_rate >= 95
+                                ? 'text-emerald-400'
+                                : row.success_rate >= 80
+                                ? 'text-amber-400'
+                                : 'text-rose-400'
+                            }`}
+                          >
+                            {row.success_rate.toFixed(1)}%
+                          </span>
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right text-muted-foreground">
+                          {formatTokens(row.prompt_tokens)} / {formatTokens(row.completion_tokens)}
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right">
+                          <span className="text-cyan-400 font-semibold">{row.cache_hit_rate.toFixed(1)}%</span>
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right font-mono font-bold text-foreground">
+                          {formatTokens(row.total_tokens)}
+                        </td>
+                        <td className="px-3.5 py-2.5 text-right font-mono text-rose-400 font-semibold">
+                          ¥{row.cost_cny.toFixed(2)}
+                        </td>
+                        <td
+                          className="px-3.5 py-2.5 text-right"
+                          onClick={e => e.stopPropagation()}
+                        >
+                          {row.can_drilldown ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setAnalyticsTargetKey({
+                                  key_hash: row.key_hash,
+                                  key_label: row.key_label,
+                                })
+                              }
+                              className="px-2 py-1 text-[11px] font-medium rounded-md bg-primary/10 text-primary hover:bg-primary/20 border border-primary/30 transition-colors"
+                            >
+                              深度分析
+                            </button>
+                          ) : (
+                            <span className="text-[11px] text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* =====================================================================
@@ -1916,8 +2383,8 @@ export default function Dashboard() {
                 type="text"
                 value={tableSearch}
                 onChange={e => setTableSearch(e.target.value)}
-                placeholder="搜索模型或渠道..."
-                className="pl-8 pr-6 py-1 text-xs bg-background border border-border rounded-lg text-foreground w-44 focus:outline-none focus:ring-1 focus:ring-primary"
+                placeholder="搜索 Key、模型或渠道..."
+                className="pl-8 pr-6 py-1 text-xs bg-background border border-border rounded-lg text-foreground w-48 focus:outline-none focus:ring-1 focus:ring-primary"
               />
               {tableSearch && (
                 <button
@@ -1930,16 +2397,20 @@ export default function Dashboard() {
               )}
             </div>
 
-            <div className="inline-flex items-center bg-muted/50 border border-border/80 rounded-lg p-0.5 gap-0.5">
+            <div className="inline-flex items-center bg-muted/50 border border-border/80 rounded-lg p-0.5 gap-0.5 flex-wrap">
               {[
                 { key: 'cross', label: `渠道 × 模型 (${filteredCrossRows.length})` },
+                { key: 'key', label: `按 Key 汇总 (${filteredKeyRows.length})` },
+                { key: 'key_model', label: `Key × 模型 (${filteredKeyModelRows.length})` },
                 { key: 'model', label: `按模型汇总 (${filteredModelRows.length})` },
                 { key: 'provider', label: `按渠道汇总 (${filteredProviderRows.length})` },
               ].map(tab => (
                 <button
                   key={tab.key}
                   type="button"
-                  onClick={() => setBreakdownTab(tab.key as 'cross' | 'model' | 'provider')}
+                  onClick={() =>
+                    setBreakdownTab(tab.key as 'cross' | 'key' | 'key_model' | 'model' | 'provider')
+                  }
                   className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${
                     breakdownTab === tab.key
                       ? 'bg-card text-foreground shadow-sm border border-border/60 font-semibold'
@@ -1988,6 +2459,210 @@ export default function Dashboard() {
                           className="hover:text-primary transition-colors"
                         >
                           {entry.provider}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 font-mono">
+                        <button
+                          type="button"
+                          onClick={() => toggleModelFilter(entry.model)}
+                          className="text-foreground font-semibold hover:text-primary transition-colors"
+                        >
+                          {entry.model}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {entry.requests.toLocaleString()}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <span
+                          className={`font-semibold ${
+                            entry.success_rate >= 95
+                              ? 'text-emerald-400'
+                              : entry.success_rate >= 80
+                              ? 'text-amber-400'
+                              : 'text-rose-400'
+                          }`}
+                        >
+                          {entry.success_rate.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {formatTokens(entry.prompt_tokens)}
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {formatTokens(entry.completion_tokens)}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <span className="text-cyan-400 font-semibold">{entry.cache_hit_rate.toFixed(1)}%</span>
+                        <span className="text-muted-foreground ml-1">({formatTokens(entry.cached_tokens)})</span>
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {entry.speed_tok_s > 0 ? `${entry.speed_tok_s.toFixed(1)} tok/s` : '-'}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono font-bold text-foreground">
+                        {formatTokens(entry.total_tokens)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        <span className="text-amber-500 font-semibold">
+                          {formatCost(entry.recorded_cost_usd)}
+                        </span>
+                        <span className="text-rose-400 ml-1.5">(¥{entry.cost_cny.toFixed(2)})</span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* 按 Key 汇总明细表 */}
+        {breakdownTab === 'key' && (
+          <div className="overflow-x-auto border border-border/70 rounded-xl">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-muted/60 text-muted-foreground font-medium">
+                <tr>
+                  <th className="px-4 py-3">API Key 名称 / 前缀</th>
+                  <th className="px-4 py-3">分组 / 母 Key</th>
+                  <th className="px-4 py-3 text-right">请求数</th>
+                  <th className="px-4 py-3 text-right">成功率</th>
+                  <th className="px-4 py-3 text-right">输入 Token</th>
+                  <th className="px-4 py-3 text-right">输出 Token</th>
+                  <th className="px-4 py-3 text-right">缓存命中率</th>
+                  <th className="px-4 py-3 text-right">速度 / 首字</th>
+                  <th className="px-4 py-3 text-right">总 Token (占比)</th>
+                  <th className="px-4 py-3 text-right">实记费用 / 等价</th>
+                  <th className="px-4 py-3 text-right">详情</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border/50 tabular-nums">
+                {filteredKeyRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={11} className="px-4 py-8 text-center text-muted-foreground">
+                      暂无匹配的 API Key 用量记录
+                    </td>
+                  </tr>
+                ) : (
+                  filteredKeyRows.map(row => (
+                    <tr
+                      key={row.key_hash}
+                      onClick={() => toggleKeyFilter(row.key_hash)}
+                      className={`hover:bg-muted/30 cursor-pointer transition-colors ${
+                        selectedKeys.includes(row.key_hash) ? 'bg-amber-500/10' : ''
+                      }`}
+                    >
+                      <td className="px-4 py-3">
+                        <div className="font-semibold text-foreground">{row.key_label}</div>
+                        <div className="text-[10px] font-mono text-muted-foreground">
+                          {row.api_key_prefix} · {row.unique_models} 模型
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {row.api_key_group || '-'}
+                        {row.parent_name ? ` (母: ${row.parent_name})` : ''}
+                      </td>
+                      <td className="px-4 py-3 text-right">{row.requests.toLocaleString()}</td>
+                      <td className="px-4 py-3 text-right font-semibold text-emerald-400">
+                        {row.success_rate.toFixed(1)}%
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {formatTokens(row.prompt_tokens)}
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {formatTokens(row.completion_tokens)}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <span className="text-cyan-400 font-bold">{row.cache_hit_rate.toFixed(1)}%</span>
+                        <span className="text-muted-foreground ml-1">({formatTokens(row.cached_tokens)})</span>
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        <span className="text-foreground font-medium">{row.speed_tok_s.toFixed(1)}</span> tok/s ·{' '}
+                        {row.avg_ttft.toFixed(1)}s
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <span className="font-semibold text-foreground">{formatTokens(row.total_tokens)}</span>
+                          <div className="w-14 h-1.5 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-amber-500"
+                              style={{ width: `${Math.min(100, row.token_share)}%` }}
+                            />
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        <span className="text-amber-500 font-semibold">
+                          {formatCost(row.recorded_cost_usd)}
+                        </span>
+                        <span className="text-rose-400 ml-1.5">(¥{row.cost_cny.toFixed(2)})</span>
+                      </td>
+                      <td
+                        className="px-4 py-3 text-right"
+                        onClick={e => e.stopPropagation()}
+                      >
+                        {row.can_drilldown ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setAnalyticsTargetKey({
+                                key_hash: row.key_hash,
+                                key_label: row.key_label,
+                              })
+                            }
+                            className="px-2 py-0.5 text-[11px] font-medium rounded bg-primary/10 text-primary hover:bg-primary/20 border border-primary/30"
+                          >
+                            分析
+                          </button>
+                        ) : (
+                          '-'
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {/* Key × 模型交叉明细表 */}
+        {breakdownTab === 'key_model' && (
+          <div className="overflow-x-auto border border-border/70 rounded-xl">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-muted/60 text-muted-foreground font-medium">
+                <tr>
+                  <th className="px-4 py-3">API Key</th>
+                  <th className="px-4 py-3">模型</th>
+                  <th className="px-4 py-3 text-right">请求次数</th>
+                  <th className="px-4 py-3 text-right">成功率</th>
+                  <th className="px-4 py-3 text-right">输入 Token</th>
+                  <th className="px-4 py-3 text-right">输出 Token</th>
+                  <th className="px-4 py-3 text-right">缓存命中率</th>
+                  <th className="px-4 py-3 text-right">生成速度</th>
+                  <th className="px-4 py-3 text-right">总 Token</th>
+                  <th className="px-4 py-3 text-right">实记费用 / 等价</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border/50 tabular-nums">
+                {filteredKeyModelRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={10} className="px-4 py-8 text-center text-muted-foreground">
+                      暂无匹配的 Key × 模型明细记录
+                    </td>
+                  </tr>
+                ) : (
+                  filteredKeyModelRows.map((entry, i) => (
+                    <tr key={i} className="hover:bg-muted/30 transition-colors">
+                      <td className="px-4 py-3 font-medium text-foreground">
+                        <button
+                          type="button"
+                          onClick={() => toggleKeyFilter(entry.key_hash)}
+                          className="hover:text-amber-400 transition-colors text-left"
+                        >
+                          <div className="font-semibold">{entry.key_label}</div>
+                          <div className="text-[10px] font-mono text-muted-foreground">
+                            {entry.api_key_prefix}
+                          </div>
                         </button>
                       </td>
                       <td className="px-4 py-3 font-mono">
@@ -2156,6 +2831,16 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+
+      {/* Key 深度分析侧滑抽屉（查看 IP 分布、配额与报错明细，全程使用安全 key_hash 不暴露完整密钥） */}
+      <KeyAnalyticsSheet
+        open={Boolean(analyticsTargetKey)}
+        onOpenChange={open => {
+          if (!open) setAnalyticsTargetKey(null);
+        }}
+        apiKeyHash={analyticsTargetKey?.key_hash}
+        apiKeyName={analyticsTargetKey?.key_label}
+      />
     </div>
   );
 }
