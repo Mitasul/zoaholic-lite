@@ -49,9 +49,6 @@ async def extract_token(request: Request, credentials: Optional[HTTPAuthorizatio
     return None
 
 
-_extract_token = extract_token
-
-
 def list_admin_api_keys(conf_or_keys: object) -> list[str]:
     """从配置字典或 api_keys 列表中提取显式声明 role 含 admin 的 API Key 列表。"""
     if isinstance(conf_or_keys, dict):
@@ -230,7 +227,7 @@ async def verify_api_key(
       会被映射到配置中的 admin API Key 的 api_index。
     """
     await ensure_initialized(request.app)
-    token = await _extract_token(request, credentials)
+    token = await extract_token(request, credentials)
     client_ip = get_client_ip_from_request_info()
     return authenticate_api_key_token(request.app, token, client_ip, request=request)
 
@@ -251,7 +248,7 @@ async def verify_admin_api_key(
     app = request.app
     await ensure_initialized(app)
 
-    token = await _extract_token(request, credentials)
+    token = await extract_token(request, credentials)
     client_ip = get_client_ip_from_request_info()
     if is_global_ip_blocked(app, client_ip):
         # 修改原因：管理接口同样属于请求入口，全局 IP 黑名单应覆盖管理员凭证。
