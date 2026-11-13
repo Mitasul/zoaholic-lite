@@ -3,6 +3,7 @@ Stats 统计和使用量路由
 """
 
 import hashlib
+import time as time_module
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Literal, Mapping
 
@@ -2907,10 +2908,10 @@ def _dashboard_sqlite_queries(has_any_filter: bool) -> dict[str, str]:
         "recent": """
             SELECT id, timestamp, model, provider, api_key, api_key_name, api_key_group,
                    prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-                   process_time, first_response_time, success, status_code
+                   process_time, first_response_time, success
             FROM request_stats
             WHERE timestamp >= {p_start} AND timestamp <= {p_end}
-            ORDER BY timestamp DESC, id DESC
+            ORDER BY timestamp DESC
             LIMIT {p_limit}
         """,
         "heatmap": f"""
@@ -2927,6 +2928,10 @@ def _dashboard_sqlite_queries(has_any_filter: bool) -> dict[str, str]:
     }
 
 
+_DASHBOARD_HEATMAP_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_DASHBOARD_HEATMAP_TTL_SEC = 120.0
+
+
 @router.get("/v1/stats/dashboard_overview", dependencies=[Depends(rate_limit_dependency)])
 async def get_dashboard_overview(
     request: Request,
@@ -2938,8 +2943,9 @@ async def get_dashboard_overview(
     provider: Optional[str] = Query(default=None, description="Optional comma-separated provider filter"),
     key_hash: Optional[str] = Query(default=None, description="Optional comma-separated key_hash filter"),
     tz_offset_minutes: int = Query(default=-480, ge=-840, le=840, description="Browser timezoneOffset in minutes (e.g. -480 for UTC+8)"),
-    recent_limit: int = Query(default=60, ge=10, le=200),
+    recent_limit: int = Query(default=40, ge=10, le=200),
     include_heatmap: bool = True,
+    force_refresh: bool = False,
 ):
     """仪表盘全景统计端点：单次请求返回全套遥测卡片、多模式时序、渠道成功率、接口分布、最近请求、热力图与多维明细。"""
     if DISABLE_DATABASE:
@@ -3097,6 +3103,23 @@ async def get_dashboard_overview(
     channel_rows: list[Mapping[str, Any]] = []
     endpoint_rows: list[Mapping[str, Any]] = []
 
+    hm_cache_key = (
+        db_type,
+        sqlite_tz_mod,
+        heatmap_start_local.date().isoformat(),
+        tuple(sorted(filter_models)),
+        tuple(sorted(filter_providers_raw)),
+        tuple(sorted(filter_key_hashes)),
+    )
+    now_mono = time_module.monotonic()
+    cached_hm_entry = _DASHBOARD_HEATMAP_CACHE.get(hm_cache_key) if (include_heatmap and not force_refresh) else None
+    cached_heatmap_payload: Optional[dict[str, Any]] = (
+        cached_hm_entry[1]
+        if (cached_hm_entry is not None and (now_mono - cached_hm_entry[0]) < _DASHBOARD_HEATMAP_TTL_SEC)
+        else None
+    )
+    need_db_heatmap = bool(include_heatmap and cached_heatmap_payload is None)
+
     if db_type == "d1":
         from db import d1_client
         if d1_client is None:
@@ -3121,7 +3144,7 @@ async def get_dashboard_overview(
         lat_rows = await d1_client.query_all(sql_templates["lat"].format(**fmt_q), [start_str, end_str])
         recent_rows_all = await d1_client.query_all(sql_templates["recent"].format(**fmt_q), [start_str, end_str, fetch_recent_limit])
         recent_rows = [r for r in recent_rows_all if _matches_row(r)][:recent_limit]
-        if include_heatmap:
+        if need_db_heatmap:
             heatmap_rows = await d1_client.query_all(sql_templates["heatmap"].format(**fmt_q), [sqlite_tz_mod, heatmap_start_str])
         channel_rows = await d1_client.query_all(
             "SELECT provider, COUNT(*) AS total, SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count "
@@ -3177,7 +3200,7 @@ async def get_dashboard_overview(
                     "limit": fetch_recent_limit,
                 })).mappings().all()
                 recent_rows = [r for r in recent_rows_all if _matches_row(r)][:recent_limit]
-                if include_heatmap:
+                if need_db_heatmap:
                     heatmap_rows = (await session.execute(sa_text(sql_templates["heatmap"].format(**fmt_named)), {
                         "tz_mod": sqlite_tz_mod,
                         "heatmap_start_str": heatmap_start_str,
@@ -3298,7 +3321,7 @@ async def get_dashboard_overview(
                         recent_rows.append(r)
 
                 ts_rows = sorted(ts_agg.values(), key=lambda x: x["bucket"])
-                if include_heatmap:
+                if need_db_heatmap:
                     raw_hm_rows = (await session.execute(
                         select(
                             RequestStat.timestamp,
@@ -3596,8 +3619,8 @@ async def get_dashboard_overview(
             "status_code": _safe_int(r.get("status_code")) or (200 if ok_bool else 500),
         })
 
-    activity_heatmap_payload: Optional[dict[str, Any]] = None
-    if include_heatmap:
+    activity_heatmap_payload: Optional[dict[str, Any]] = cached_heatmap_payload
+    if need_db_heatmap:
         heatmap_by_day: dict[str, dict[str, int]] = {}
         for r in heatmap_rows:
             d_key = str(r.get("day") or "")
@@ -3636,6 +3659,9 @@ async def get_dashboard_overview(
             "peak_day_requests": hm_peak_reqs,
             "peak_day_date": hm_peak_date or "--",
         }
+        if len(_DASHBOARD_HEATMAP_CACHE) > 64:
+            _DASHBOARD_HEATMAP_CACHE.clear()
+        _DASHBOARD_HEATMAP_CACHE[hm_cache_key] = (now_mono, activity_heatmap_payload)
 
     s_fin = _finalize_stat_metrics(summary_acc, rate_digits=2)
     summary = {

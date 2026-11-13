@@ -460,7 +460,114 @@ const getHeatmapCellColor = (reqs: number, maxReqs: number): string => {
   return 'bg-[#ef7d52] shadow-[0_0_6px_rgba(239,125,82,0.45)]';
 };
 
-/** 独立热力图子组件：将 hoveredDay 悬浮状态隔离在子组件内部，避免鼠标滑过 365 天格子时触发整页重渲染 */
+/** 独立导航胶囊与回到顶部组件：将滚动监听状态完全隔离在小组件内，页面滚动时主 Dashboard 0 次重渲染 */
+const ScrollSpyNavPills = memo(function ScrollSpyNavPills({
+  onJump,
+}: {
+  onJump: (id: string) => void;
+}) {
+  const [activeAnchor, setActiveAnchor] = useState<string>('section-overview');
+
+  useEffect(() => {
+    const scrollEl = document.getElementById('app-main-scroll');
+    if (!scrollEl) return;
+
+    let timer: number | null = null;
+    const onScroll = () => {
+      if (timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        const containerTop = scrollEl.getBoundingClientRect().top;
+        let currentSection: string = NAV_SECTIONS[0].id;
+        for (const sec of NAV_SECTIONS) {
+          const dom = document.getElementById(sec.id);
+          if (dom && dom.getBoundingClientRect().top - containerTop <= 180) {
+            currentSection = sec.id;
+          }
+        }
+        setActiveAnchor(prev => (prev === currentSection ? prev : currentSection));
+      }, 160);
+    };
+
+    scrollEl.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      scrollEl.removeEventListener('scroll', onScroll);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  return (
+    <div className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full sm:flex-wrap pb-0.5 sm:pb-0">
+      {NAV_SECTIONS.map(nav => {
+        const isActive = activeAnchor === nav.id;
+        return (
+          <button
+            key={nav.id}
+            type="button"
+            onClick={() => {
+              setActiveAnchor(nav.id);
+              onJump(nav.id);
+            }}
+            className={`px-2.5 py-1 text-xs font-medium rounded-full whitespace-nowrap shrink-0 ${
+              isActive
+                ? 'bg-primary/15 text-primary border border-primary/40 font-semibold'
+                : 'text-muted-foreground hover:text-foreground hover:bg-muted/60 border border-transparent'
+            }`}
+          >
+            {nav.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+});
+
+const BackToTopButton = memo(function BackToTopButton({
+  onClick,
+}: {
+  onClick: () => void;
+}) {
+  const [isScrolled, setIsScrolled] = useState(false);
+
+  useEffect(() => {
+    const scrollEl = document.getElementById('app-main-scroll');
+    if (!scrollEl) return;
+
+    let timer: number | null = null;
+    const onScroll = () => {
+      if (timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        const next = scrollEl.scrollTop > 80;
+        setIsScrolled(prev => (prev === next ? prev : next));
+      }, 160);
+    };
+
+    scrollEl.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      scrollEl.removeEventListener('scroll', onScroll);
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title="回到顶部"
+      className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs font-medium rounded-xl border whitespace-nowrap ${
+        isScrolled
+          ? 'bg-primary text-primary-foreground border-primary shadow-sm'
+          : 'text-muted-foreground hover:text-foreground bg-muted/40 border-border/80'
+      }`}
+    >
+      <ArrowUp className="w-3.5 h-3.5" />
+      <span className="hidden sm:inline">回到顶部</span>
+    </button>
+  );
+});
+
+/** 独立热力图子组件：使用 DOM ref 直接更新悬浮提示文本，鼠标滑过 365 天格子时 0 次 React 重渲染 */
 const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
   heatmap,
   hasActiveFilter,
@@ -468,7 +575,14 @@ const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
   heatmap: ActivityHeatmapData | null;
   hasActiveFilter: boolean;
 }) {
-  const [hoveredDay, setHoveredDay] = useState<HeatmapDay | null>(null);
+  const hoverLabelRef = useRef<HTMLSpanElement | null>(null);
+  const defaultSummaryText = `${heatmap?.active_days || 0} 天有活动 · 共 ${(heatmap?.total_requests || 0).toLocaleString()} 次请求`;
+
+  useEffect(() => {
+    if (hoverLabelRef.current) {
+      hoverLabelRef.current.textContent = defaultSummaryText;
+    }
+  }, [defaultSummaryText]);
 
   const heatmapGrid = useMemo(() => {
     const days = heatmap?.days || [];
@@ -506,6 +620,7 @@ const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
   return (
     <div
       id="section-heatmap"
+      style={{ contentVisibility: 'auto', containIntrinsicSize: '0 250px' }}
       className="bg-card border border-border/80 rounded-2xl p-3.5 sm:p-5 shadow-sm space-y-4 min-w-0 overflow-hidden"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -516,15 +631,7 @@ const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
           </span>
         </div>
         <div className="text-xs text-muted-foreground tabular-nums">
-          {hoveredDay ? (
-            <span className="text-foreground font-medium">
-              {hoveredDay.date} · {hoveredDay.requests.toLocaleString()} 次请求 · {formatTokens(hoveredDay.total_tokens)} tokens
-            </span>
-          ) : (
-            <span>
-              {heatmap?.active_days || 0} 天有活动 · 共 {(heatmap?.total_requests || 0).toLocaleString()} 次请求
-            </span>
-          )}
+          <span ref={hoverLabelRef}>{defaultSummaryText}</span>
         </div>
       </div>
 
@@ -550,7 +657,14 @@ const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
                 <span className="h-[10px]" />
               </div>
 
-              <div className="flex gap-[3px]">
+              <div
+                className="flex gap-[3px]"
+                onMouseLeave={() => {
+                  if (hoverLabelRef.current) {
+                    hoverLabelRef.current.textContent = defaultSummaryText;
+                  }
+                }}
+              >
                 {heatmapGrid.weeks.map((week, wIdx) => (
                   <div key={wIdx} className="grid grid-rows-7 gap-[3px]">
                     {week.map((day, dIdx) =>
@@ -559,10 +673,12 @@ const ActivityHeatmapSection = memo(function ActivityHeatmapSection({
                       ) : (
                         <span
                           key={day.date}
-                          onMouseEnter={() => setHoveredDay(day)}
-                          onMouseLeave={() => setHoveredDay(null)}
-                          title={`${day.date}: ${day.requests} 请求 / ${formatTokens(day.total_tokens)} tokens`}
-                          className={`w-[10px] h-[10px] rounded-[2px] transition-transform hover:scale-125 cursor-pointer ${getHeatmapCellColor(
+                          onMouseEnter={() => {
+                            if (hoverLabelRef.current) {
+                              hoverLabelRef.current.textContent = `${day.date} · ${day.requests.toLocaleString()} 次请求 · ${formatTokens(day.total_tokens)} tokens`;
+                            }
+                          }}
+                          className={`w-[10px] h-[10px] rounded-[2px] hover:ring-1 hover:ring-foreground/70 ${getHeatmapCellColor(
                             day.requests,
                             heatmapGrid.maxReqs
                           )}`}
@@ -637,18 +753,15 @@ export default function Dashboard() {
   const [showProviderDrawer, setShowProviderDrawer] = useState(false);
   const [showKeyDrawer, setShowKeyDrawer] = useState(false);
   const [showAllModels, setShowAllModels] = useState(false);
+  // 默认折叠筛选栏（除非用户主动设置为展开 '0'），保持顶部吸顶栏轻巧不挡屏
   const [filtersCollapsed, setFiltersCollapsed] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('zoa_dashboard_filters_collapsed') === '1';
+      return localStorage.getItem('zoa_dashboard_filters_collapsed') !== '0';
     } catch {
-      return false;
+      return true;
     }
   });
   const [analyticsTargetKey, setAnalyticsTargetKey] = useState<{ key_hash: string; key_label: string } | null>(null);
-
-  // 导航与滚动监听状态
-  const [activeAnchor, setActiveAnchor] = useState<string>('section-overview');
-  const [isScrolled, setIsScrolled] = useState(false);
 
   // 时序图模式：token (Token+请求) | cache (缓存/未缓存/输出堆叠) | models (分模型折线) | keys (分Key折线) | requests (成功/失败) | throughput (吞吐/首字)
   const [chartMode, setChartMode] = useState<'token' | 'cache' | 'models' | 'keys' | 'requests' | 'throughput'>('token');
@@ -696,20 +809,22 @@ export default function Dashboard() {
     });
   }, []);
 
-  const fetchDashboard = useCallback(async (forceHeatmap = false) => {
+  const fetchDashboard = useCallback(async (forceRefresh = false) => {
     if (!token) return;
     setLoading(true);
     const hours = RANGE_OPTIONS.find(r => r.key === rangeKey)?.hours || 72;
     const tzOffset = new Date().getTimezoneOffset();
 
-    const filterSig = `${[...selectedModels].sort().join(',')}|${[...selectedProviders].sort().join(',')}|${[...selectedKeys].sort().join(',')}|${ tzOffset }`;
-    const needHeatmap = forceHeatmap || lastHeatmapFilterSigRef.current !== filterSig;
+    const filterSig = `${[...selectedModels].sort().join(',')}|${[...selectedProviders].sort().join(',')}|${[...selectedKeys].sort().join(',')}|${tzOffset}`;
+    const needHeatmap = forceRefresh || lastHeatmapFilterSigRef.current !== filterSig;
 
     const params = new URLSearchParams();
     params.set('range_key', rangeKey);
     params.set('tz_offset_minutes', String(tzOffset));
-    params.set('recent_limit', '80');
-    params.set('include_heatmap', needHeatmap ? 'true' : 'false');
+    params.set('recent_limit', '35');
+    // 首屏/主查询跳过 365 天热力图，使 KPI 与时序图毫秒级返回；热力图延后异步加载
+    params.set('include_heatmap', 'false');
+    if (forceRefresh) params.set('force_refresh', 'true');
     if (customStart) params.set('start_datetime', new Date(customStart).toISOString());
     if (customEnd) params.set('end_datetime', new Date(customEnd).toISOString());
     if (selectedModels.length > 0) params.set('model', selectedModels.join(','));
@@ -733,10 +848,6 @@ export default function Dashboard() {
           setAvailableKeys(data.available_keys || []);
           setRecentRequests(data.recent_requests || []);
           setRecentTotal(data.recent_total || 0);
-          if (data.activity_heatmap) {
-            setHeatmap(data.activity_heatmap);
-            lastHeatmapFilterSigRef.current = filterSig;
-          }
           setModelBreakdown(data.model_breakdown || []);
           setProviderBreakdown(data.provider_breakdown || []);
           setKeyBreakdown(data.key_breakdown || []);
@@ -751,6 +862,26 @@ export default function Dashboard() {
             })),
             endpoint_request_counts: data.endpoint_request_counts || [],
           });
+
+          if (needHeatmap) {
+            const hmParams = new URLSearchParams(params);
+            hmParams.set('include_heatmap', 'true');
+            hmParams.set('recent_limit', '10');
+            window.setTimeout(async () => {
+              try {
+                const hmRes = await apiFetch(`/v1/stats/dashboard_overview?${hmParams.toString()}`);
+                if (hmRes.ok) {
+                  const hmData = await hmRes.json();
+                  if (hmData.activity_heatmap) {
+                    setHeatmap(hmData.activity_heatmap);
+                    lastHeatmapFilterSigRef.current = filterSig;
+                  }
+                }
+              } catch {
+                // ignore background heatmap error
+              }
+            }, 80);
+          }
           return;
         }
       }
@@ -772,41 +903,7 @@ export default function Dashboard() {
     fetchDashboard(false);
   }, [fetchDashboard]);
 
-  // 监听外层 #app-main-scroll 滚动容器，使用 rAF 节流 + 值比对避免滚动时高频触发整页重渲染
-  useEffect(() => {
-    const scrollEl = document.getElementById('app-main-scroll');
-    if (!scrollEl) return;
-
-    let rafId: number | null = null;
-    const onScroll = () => {
-      if (rafId !== null) return;
-      rafId = window.requestAnimationFrame(() => {
-        rafId = null;
-        const st = scrollEl.scrollTop;
-        const nextScrolled = st > 80;
-        setIsScrolled(prev => (prev === nextScrolled ? prev : nextScrolled));
-
-        const containerTop = scrollEl.getBoundingClientRect().top;
-        let currentSection: string = NAV_SECTIONS[0].id;
-        for (const sec of NAV_SECTIONS) {
-          const dom = document.getElementById(sec.id);
-          if (dom && dom.getBoundingClientRect().top - containerTop <= 180) {
-            currentSection = sec.id;
-          }
-        }
-        setActiveAnchor(prev => (prev === currentSection ? prev : currentSection));
-      });
-    };
-
-    scrollEl.addEventListener('scroll', onScroll, { passive: true });
-    return () => {
-      scrollEl.removeEventListener('scroll', onScroll);
-      if (rafId !== null) window.cancelAnimationFrame(rafId);
-    };
-  }, []);
-
-  const scrollToSection = (id: string) => {
-    setActiveAnchor(id);
+  const scrollToSection = useCallback((id: string) => {
     const scrollEl = document.getElementById('app-main-scroll');
     const target = document.getElementById(id);
     if (scrollEl && target) {
@@ -819,16 +916,16 @@ export default function Dashboard() {
     } else if (target) {
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
-  };
+  }, []);
 
-  const scrollToTop = () => {
+  const scrollToTop = useCallback(() => {
     const scrollEl = document.getElementById('app-main-scroll');
     if (scrollEl) {
       scrollEl.scrollTo({ top: 0, behavior: 'smooth' });
     } else {
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
-  };
+  }, []);
 
   const toggleModelFilter = (modelName: string) => {
     setSelectedModels(prev =>
@@ -1032,30 +1129,11 @@ export default function Dashboard() {
              - 随页面滚动常驻顶部，使「模块跳转」「时间/模型切换」「回到顶部」真正随时可用
              - 集成全局模型与渠道过滤，一键驱动全页所有卡片（尤其是缓存命中率）与图表
          ===================================================================== */}
-      <div className="sticky -top-2.5 sm:-top-4 md:-top-8 z-30 pt-1.5 pb-1.5 bg-background/90 backdrop-blur-md border-b border-border/70 shadow-sm transition-all min-w-0">
-        <div className="bg-card/95 border border-border/80 rounded-2xl px-2.5 sm:px-3.5 py-2 sm:py-2.5 shadow-sm space-y-2 min-w-0">
-          {/* 第一行：锚点跳转 + 时间粒度 + 刷新 & 回到顶部 */}
+      <div className="sticky -top-2.5 sm:-top-4 md:-top-8 z-30 pt-1.5 pb-1.5 bg-background border-b border-border/70 shadow-sm min-w-0">
+        <div className="bg-card border border-border/80 rounded-2xl px-2.5 sm:px-3.5 py-2 sm:py-2.5 shadow-sm space-y-2 min-w-0">
+          {/* 第一行：锚点跳转 + 时间粒度 + 筛选折叠 + 刷新 & 回到顶部 */}
           <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2 min-w-0">
-            {/* 模块快捷跳转胶囊（移动端单行横向滑动，桌面端自动换行） */}
-            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar max-w-full sm:flex-wrap pb-0.5 sm:pb-0">
-              {NAV_SECTIONS.map(nav => {
-                const isActive = activeAnchor === nav.id;
-                return (
-                  <button
-                    key={nav.id}
-                    type="button"
-                    onClick={() => scrollToSection(nav.id)}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-full transition-all whitespace-nowrap shrink-0 ${
-                      isActive
-                        ? 'bg-primary/15 text-primary border border-primary/40 font-semibold'
-                        : 'text-muted-foreground hover:text-foreground hover:bg-muted/60 border border-transparent'
-                    }`}
-                  >
-                    {nav.label}
-                  </button>
-                );
-              })}
-            </div>
+            <ScrollSpyNavPills onJump={scrollToSection} />
 
             {/* 时间范围 + 操作按钮 */}
             <div className="flex items-center justify-between sm:justify-end gap-1.5 min-w-0">
@@ -1071,7 +1149,7 @@ export default function Dashboard() {
                         setCustomEnd('');
                         setRangeKey(opt.key);
                       }}
-                      className={`px-2 sm:px-2.5 py-1 text-xs font-medium rounded-lg transition-all whitespace-nowrap shrink-0 ${
+                      className={`px-2 sm:px-2.5 py-1 text-xs font-medium rounded-lg whitespace-nowrap shrink-0 ${
                         active
                           ? 'bg-primary text-primary-foreground shadow-sm'
                           : 'text-muted-foreground hover:text-foreground hover:bg-muted/60'
@@ -1084,7 +1162,7 @@ export default function Dashboard() {
                 <button
                   type="button"
                   onClick={() => setShowCustomTime(v => !v)}
-                  className={`px-2 sm:px-2.5 py-1 text-xs font-medium rounded-lg transition-all inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                  className={`px-2 sm:px-2.5 py-1 text-xs font-medium rounded-lg inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
                     customStart || customEnd || showCustomTime
                       ? 'bg-primary/15 text-primary border border-primary/30'
                       : 'text-muted-foreground hover:text-foreground'
@@ -1100,8 +1178,8 @@ export default function Dashboard() {
                 <button
                   type="button"
                   onClick={toggleFiltersCollapsed}
-                  title={filtersCollapsed ? '展开筛选面板' : '收起筛选面板'}
-                  className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs font-medium rounded-xl border transition-all whitespace-nowrap ${
+                  title={filtersCollapsed ? '展开模型/Key/渠道筛选面板' : '收起筛选面板'}
+                  className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs font-medium rounded-xl border whitespace-nowrap ${
                     hasActiveFilter
                       ? 'bg-primary/15 text-primary border-primary/40 font-semibold'
                       : !filtersCollapsed
@@ -1110,7 +1188,7 @@ export default function Dashboard() {
                   }`}
                 >
                   <Filter className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">筛选</span>
+                  <span>{filtersCollapsed ? '展开筛选' : '收起筛选'}</span>
                   {activeFilterCount > 0 && (
                     <span className="px-1.5 py-0.2 rounded-full bg-primary text-primary-foreground text-[10px] font-bold tabular-nums leading-tight">
                       {activeFilterCount}
@@ -1132,19 +1210,7 @@ export default function Dashboard() {
                   <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-primary' : ''}`} />
                 </button>
 
-                <button
-                  type="button"
-                  onClick={scrollToTop}
-                  title="回到顶部"
-                  className={`inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 text-xs font-medium rounded-xl border transition-all whitespace-nowrap ${
-                    isScrolled
-                      ? 'bg-primary text-primary-foreground border-primary shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground bg-muted/40 border-border/80'
-                  }`}
-                >
-                  <ArrowUp className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">回到顶部</span>
-                </button>
+                <BackToTopButton onClick={scrollToTop} />
               </div>
             </div>
           </div>
@@ -2119,6 +2185,7 @@ export default function Dashboard() {
          ===================================================================== */}
       <div
         id="section-key-usage"
+        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 360px' }}
         className="bg-card border border-border/80 rounded-2xl p-3.5 sm:p-5 shadow-sm space-y-4 min-w-0 overflow-hidden"
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2355,7 +2422,11 @@ export default function Dashboard() {
       {/* =====================================================================
           3. 渠道与模型分布三联图（原版经典 3 图同屏：渠道成功率 + 模型分布 + Endpoint 分布）
          ===================================================================== */}
-      <div id="section-distributions" className="grid grid-cols-1 lg:grid-cols-12 gap-4 min-w-0">
+      <div
+        id="section-distributions"
+        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 300px' }}
+        className="grid grid-cols-1 lg:grid-cols-12 gap-4 min-w-0"
+      >
         {/* 渠道成功率 (%) */}
         <div className="lg:col-span-5 bg-card border border-border/80 rounded-2xl p-3.5 sm:p-5 shadow-sm min-w-0 overflow-hidden">
           <div className="flex items-center justify-between gap-2 mb-4">
@@ -2511,6 +2582,7 @@ export default function Dashboard() {
          ===================================================================== */}
       <div
         id="section-channel-health"
+        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 320px' }}
         className="bg-card border border-border/80 rounded-2xl shadow-sm overflow-hidden min-w-0"
       >
         <div className="px-3.5 sm:px-5 py-3.5 sm:py-4 border-b border-border/70 bg-muted/20 flex flex-wrap items-center justify-between gap-2">
@@ -2626,6 +2698,7 @@ export default function Dashboard() {
          ===================================================================== */}
       <div
         id="section-breakdown"
+        style={{ contentVisibility: 'auto', containIntrinsicSize: '0 400px' }}
         className="bg-card border border-border/80 rounded-2xl p-3.5 sm:p-5 shadow-sm space-y-4 min-w-0 overflow-hidden"
       >
         <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center sm:justify-between gap-2.5 sm:gap-3 min-w-0">
